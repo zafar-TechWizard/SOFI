@@ -212,3 +212,7 @@ def register_exec_tools(registry) -> None:
         capability_description="Execute Python code snippets on Zafar's machine.",
         capability_refusal="I won't run that code.",
     ))
+
+
+# Auto-discovery alias — brain.py looks for register(registry)
+register = register_exec_tools

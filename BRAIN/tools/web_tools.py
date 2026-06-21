@@ -233,3 +233,7 @@ def register_web_tools(registry) -> None:
         capability_description="Get real-time weather and 3-day forecasts for any city.",
         capability_refusal="I can't reach the weather service right now.",
     ))
+
+
+# Auto-discovery alias — brain.py looks for register(registry)
+register = register_web_tools

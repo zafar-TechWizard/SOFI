@@ -379,3 +379,7 @@ def register_background_tools(registry: ToolRegistry) -> None:
         capability_name="background_research",
         capability_description="Run a research query in the background while conversing.",
     ))
+
+
+# Auto-discovery alias — brain.py looks for register(registry)
+register = register_background_tools

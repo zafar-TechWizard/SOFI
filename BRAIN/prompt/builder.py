@@ -87,9 +87,14 @@ def _memory_blocks(memory_state) -> str:
     assoc = list(getattr(memory_state, "associations", None) or [])
 
     if must_know:
-        body = format_memories(must_know, max_items=MAX_MUST_KNOW)
+        body = (
+            "These are real — not background data. "
+            "If any feel relevant to what Zafar just said, let them shape what you say. "
+            "Don't announce them ('I recall that…') — just be informed by them.\n\n"
+            + format_memories(must_know, max_items=MAX_MUST_KNOW)
+        )
         out_parts.append(_section(
-            "WHAT YOU REMEMBER (most relevant to this moment)",
+            "WHAT YOU REMEMBER (let these inform your response)",
             body,
         ))
 
@@ -152,6 +157,8 @@ _OUTPUT_CONTRACT = (
     "\n\n━━━ NOW SPEAK ━━━\n\n"
     "Your response begins immediately. Every word you output goes directly to Zafar — "
     "no notes to yourself, no planning visible, no reasoning narrated. "
+    "Let any relevant memories above inform what you say — not as citations, "
+    "but as genuine context that makes your response feel continuous and aware. "
     "Never write 'The user...', 'I should...', 'Let me...', or any self-commentary. "
     "Speak. Don't think out loud."
 )

@@ -40,6 +40,14 @@ from BRAIN.llm.groq_client import LLMResponse, LLMToolCall
 
 _log = logging.getLogger("sofi.brain.gemini")
 
+# Silence the Google GenAI SDK's own logger that prints
+# "Warning: there are non-text parts in the response: ['thought_signature']"
+# on every tool-call turn. This is an SDK-level print to its own logger,
+# not a Python warnings.warn() call, so filterwarnings() has no effect on it.
+logging.getLogger("google.generativeai").setLevel(logging.ERROR)
+logging.getLogger("google.genai").setLevel(logging.ERROR)
+logging.getLogger("google.ai.generativelanguage").setLevel(logging.ERROR)
+
 # ── Available model constants (for easy switching) ──────────────────────────
 GEMINI_FLASH          = "gemini-2.0-flash"          # default — fast, free tier generous
 GEMINI_FLASH_LITE     = "gemini-2.0-flash-lite"

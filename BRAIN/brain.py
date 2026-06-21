@@ -157,17 +157,10 @@ class Brain:
             self._llm = GeminiClient(model=self._model_override)
 
         _tick("registering tools")
-        from BRAIN.tools.dummy_tools import register_dummy_tools
-        from BRAIN.tools.background_tools import register_background_tools
-        from BRAIN.tools.web_tools import register_web_tools
-        from BRAIN.tools.fs_tools import register_fs_tools
-        from BRAIN.tools.exec_tools import register_exec_tools
         self._tool_registry = ToolRegistry()
-        register_dummy_tools(self._tool_registry)
-        register_background_tools(self._tool_registry)
-        register_web_tools(self._tool_registry)
-        register_fs_tools(self._tool_registry)
-        register_exec_tools(self._tool_registry)
+        _auto_register_tools(self._tool_registry)
+        from BRAIN.tools._agent_tools import register_agent_tools
+        register_agent_tools(self._tool_registry, self._llm)
         self._tool_registry.sync_with_self_model(self._self_model)
         set_self_model(self._self_model)
         warm_cache()
@@ -231,14 +224,25 @@ class Brain:
             "BRAIN.llm.gemini_client",
             "BRAIN.llm",
             "BRAIN.tools.registry",
-            "BRAIN.tools.dummy_tools",
-            "BRAIN.tools.background_tools",
-            "BRAIN.tools.web_tools",
-            "BRAIN.tools.fs_tools",
-            "BRAIN.tools.exec_tools",
             "BRAIN.tools",
+            "BRAIN.agents.definitions",
+            "BRAIN.agents.orchestrator",
+            "BRAIN.agents",
+            "BRAIN.tools._agent_tools",
+            "BRAIN.skills._registry",
             "BRAIN.brain",
         ]
+
+        # Also dynamically include all tool modules found in BRAIN/tools/
+        # so newly added tool files are picked up on hot-reload without
+        # needing a manual RELOAD_ORDER edit.
+        from pathlib import Path as _HRPath
+        _tools_dir = _HRPath(__file__).parent / "tools"
+        for _p in sorted(_tools_dir.glob("*.py")):
+            if not _p.stem.startswith("_"):
+                _mod = f"BRAIN.tools.{_p.stem}"
+                if _mod not in RELOAD_ORDER:
+                    RELOAD_ORDER.insert(RELOAD_ORDER.index("BRAIN.tools"), _mod)
 
         reloaded, failed = 0, 0
         for mod_name in RELOAD_ORDER:
@@ -295,6 +299,11 @@ class Brain:
                 _log.warning("shutdown | background tasks timed out — cancelling")
                 for t in self._background_tasks:
                     t.cancel()
+
+        # Auto-run consolidation in background on shutdown so memories accumulate
+        # without Zafar having to remember to run it manually.
+        # Runs in a daemon thread so it doesn't block the shutdown sequence.
+        _trigger_consolidation_on_shutdown()
 
         if self._memory:
             try:
@@ -458,6 +467,20 @@ class Brain:
                             "len=%d preview=%.80s", len(response.text), response.text,
                         )
 
+                    # ── Acknowledgement-first for slow/multi-tool batches ──
+                    # Fast tools (read_file, list_directory, get_current_time) run
+                    # silently — they're quick enough that an ack would just be noise.
+                    # Slow tools (web_search, run_command, write_file, etc.) or batches
+                    # of 2+ tools get a brief ack so Zafar knows she's on it immediately,
+                    # before the work starts.
+                    ack_text = _ack_for_tools(response.tool_calls)
+                    if ack_text and iteration == 1:
+                        # Only ack on the FIRST iteration — subsequent tool rounds
+                        # are follow-up actions inside the same turn; no need to ack again.
+                        display_text += ack_text
+                        response_text += ack_text
+                        yield ack_text
+
                     # Build assistant message with tool_calls (Groq/OpenAI format).
                     # For Gemini thinking models, also carry raw_content so that
                     # _messages_to_contents can pass the original Content object back
@@ -482,20 +505,16 @@ class Brain:
                         assistant_msg["_raw_content"] = response.raw_content
                     messages.append(assistant_msg)
 
-                    # Execute each tool call.
-                    # Track whether any inline tool ran — determines whether we need
-                    # a second LLM call after this batch.
+                    # ── Phase 1: Show all labels upfront + dispatch background tools ──
+                    # All tool labels appear immediately so Zafar sees the full
+                    # work plan before any tool has finished executing.
                     had_inline = False
+                    inline_tcs = []
+                    bg_dispatched: Dict[str, Any] = {}  # tc.id → workspace_item_id
 
                     for tc in response.tool_calls:
-                        tool_call = ToolCall(
-                            id=tc.id,
-                            name=tc.name,
-                            arguments=tc.arguments,
-                        )
                         is_bg = self._tool_registry.is_background(tc.name)
 
-                        # ── Inline display marker ──
                         tool_label = _tool_display_name(tc.name, is_bg)
                         status_line = f"\n\n`{tool_label}`\n\n"
                         display_text += status_line
@@ -509,62 +528,99 @@ class Brain:
                         })
 
                         if is_bg:
-                            # ── BACKGROUND: fire-and-forget ──
                             _log.info(
                                 "process | background dispatch | tool=%s args=%s",
                                 tc.name, _args_preview(tc.arguments),
                             )
-                            item_id = self._dispatch_background(tool_call)
-
-                            # Placeholder keeps the message history valid in case
-                            # this turn has mixed tools (background + inline). If it's
-                            # all-background we break before the next call, so it's a no-op.
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tc.id,
-                                "content": "Dispatched to background — running independently.",
-                            })
-
+                            item_id = self._dispatch_background(
+                                ToolCall(id=tc.id, name=tc.name, arguments=tc.arguments)
+                            )
+                            bg_dispatched[tc.id] = item_id
                             self._emit_tool_event("tool_dispatched", {
                                 "name": tc.name,
                                 "args": tc.arguments,
                                 "iteration": iteration,
                                 "workspace_item_id": item_id,
                             })
-
                         else:
-                            # ── INLINE: await result ──
                             had_inline = True
-                            _log.debug("process | inline execute | tool=%s", tc.name)
-                            result = await self._tool_registry.execute(tool_call)
+                            inline_tcs.append(tc)
 
-                            _log.info(
-                                "process | inline complete | tool=%s success=%s "
-                                "duration_ms=%.0f output=%.80s",
-                                tc.name, result.success, result.duration_ms,
-                                result.output[:80] if result.output else "",
+                    # ── Phase 2: Execute all inline tools in parallel ──
+                    # asyncio.gather runs them concurrently; wall-clock time =
+                    # slowest single tool instead of sum of all tools.
+                    # return_exceptions=True prevents one failure from cancelling others.
+                    inline_results: Dict[str, Any] = {}  # tc.id → result | Exception
+
+                    if inline_tcs:
+                        async def _exec_tc(tc):
+                            _log.debug("process | inline execute | tool=%s", tc.name)
+                            return await self._tool_registry.execute(
+                                ToolCall(id=tc.id, name=tc.name, arguments=tc.arguments)
                             )
 
-                            self._emit_tool_event("tool_end", {
-                                "name": tc.name,
-                                "success": result.success,
-                                "duration_ms": result.duration_ms,
-                                "iteration": iteration,
-                            })
+                        gathered = await asyncio.gather(
+                            *[_exec_tc(tc) for tc in inline_tcs],
+                            return_exceptions=True,
+                        )
 
-                            self._last_tool_calls.append({
-                                "name": tc.name,
-                                "args": tc.arguments,
-                                "success": result.success,
-                                "duration_ms": result.duration_ms,
-                                "output_preview": result.output[:200] if result.output else "",
-                            })
+                        for tc, result in zip(inline_tcs, gathered):
+                            inline_results[tc.id] = result
+                            if isinstance(result, Exception):
+                                _log.error(
+                                    "process | inline tool error | tool=%s exc=%s",
+                                    tc.name, result,
+                                )
+                                self._emit_tool_event("tool_end", {
+                                    "name": tc.name,
+                                    "success": False,
+                                    "duration_ms": 0,
+                                    "iteration": iteration,
+                                })
+                            else:
+                                _log.info(
+                                    "process | inline complete | tool=%s success=%s "
+                                    "duration_ms=%.0f output=%.80s",
+                                    tc.name, result.success, result.duration_ms,
+                                    result.output[:80] if result.output else "",
+                                )
+                                self._emit_tool_event("tool_end", {
+                                    "name": tc.name,
+                                    "success": result.success,
+                                    "duration_ms": result.duration_ms,
+                                    "iteration": iteration,
+                                })
+                                self._last_tool_calls.append({
+                                    "name": tc.name,
+                                    "args": tc.arguments,
+                                    "success": result.success,
+                                    "duration_ms": result.duration_ms,
+                                    "output_preview": result.output[:200] if result.output else "",
+                                })
 
+                    # ── Phase 3: Append tool messages in original tool_calls order ──
+                    # Preserving order keeps Groq and Gemini message history valid.
+                    for tc in response.tool_calls:
+                        if tc.id in bg_dispatched:
                             messages.append({
                                 "role": "tool",
                                 "tool_call_id": tc.id,
-                                "content": result.to_string(),
+                                "content": "Dispatched to background — running independently.",
                             })
+                        elif tc.id in inline_results:
+                            result = inline_results[tc.id]
+                            if isinstance(result, Exception):
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tc.id,
+                                    "content": f"Tool error: {result}",
+                                })
+                            else:
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tc.id,
+                                    "content": result.to_string(),
+                                })
 
                     # ── Decide whether to loop back ──
                     if had_inline:
@@ -944,6 +1000,143 @@ class Brain:
 # Helpers
 # =============================================================================
 
+def _trigger_consolidation_on_shutdown() -> None:
+    """
+    Fire consolidation in a background daemon thread on shutdown.
+
+    Only runs if there are conversation logs newer than the last consolidation
+    run. Non-blocking — returns immediately. Daemon thread dies with the process
+    if it hasn't finished, so it never delays an exit.
+    """
+    import threading
+    from pathlib import Path as _P
+
+    def _run():
+        try:
+            # Quick check: any conversation log files exist?
+            log_dir = _P(__file__).parent / "memory" / "data"
+            conv_file = log_dir / "conversation.json"
+            if not conv_file.exists():
+                _log.debug("consolidation | no conversation log — skipping")
+                return
+
+            _log.info("consolidation | auto-running on shutdown")
+            import subprocess, sys as _sys
+            proc = subprocess.Popen(
+                [_sys.executable, "-m", "memory.processing.consolidation_runner"],
+                cwd=str(_P(__file__).parent.parent),  # workspace root
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            proc.wait(timeout=400)
+            _log.info("consolidation | completed (exit=%d)", proc.returncode)
+        except Exception as exc:
+            _log.warning("consolidation | auto-run failed: %s", exc)
+
+    t = threading.Thread(target=_run, daemon=True, name="sofi-consolidation")
+    t.start()
+
+
+def _auto_register_tools(registry) -> None:
+    """
+    Auto-discover and register all tool modules in BRAIN/tools/.
+
+    Any Python file in that directory that exposes a top-level function named
+    'register' (callable, takes one argument: the registry) is imported and
+    called automatically. Adding a new tool file requires zero changes to
+    brain.py — just drop the file and implement register(registry).
+
+    Discovery order: alphabetical by filename (consistent across runs).
+    Files starting with '_' are skipped (private/test modules).
+    """
+    import importlib
+    from pathlib import Path as _Path
+
+    tools_dir = _Path(__file__).parent / "tools"
+    registered, skipped = [], []
+
+    for path in sorted(tools_dir.glob("*.py")):
+        if path.stem.startswith("_"):
+            continue  # skip __init__, _test*, etc.
+
+        module_name = f"BRAIN.tools.{path.stem}"
+        try:
+            mod = importlib.import_module(module_name)
+        except Exception as exc:
+            _log.warning("_auto_register_tools | import failed | module=%s exc=%s", module_name, exc)
+            skipped.append(path.stem)
+            continue
+
+        # Look for a register(registry) function
+        register_fn = getattr(mod, "register", None)
+        if register_fn is None or not callable(register_fn):
+            continue  # no register() in this file — skip silently
+
+        try:
+            register_fn(registry)
+            registered.append(path.stem)
+            _log.debug("_auto_register_tools | registered | module=%s", path.stem)
+        except Exception as exc:
+            _log.warning(
+                "_auto_register_tools | register() failed | module=%s exc=%s",
+                path.stem, exc,
+            )
+            skipped.append(path.stem)
+
+    _log.info(
+        "_auto_register_tools | done | registered=%s skipped=%s total_tools=%d",
+        registered, skipped, registry.tool_count,
+    )
+
+
+# Tools that take noticeable time (>~500ms). Only these trigger an ack.
+# Fast tools (list_directory, read_file, get_current_time) run silently — no ack.
+_SLOW_TOOLS: frozenset = frozenset({
+    "web_search", "web_fetch", "get_weather",
+    "run_command", "run_python",
+    "write_file", "patch_file",
+    "simulate_slow_search",
+    "spawn_agent",
+})
+
+
+def _ack_for_tools(tool_calls) -> str:
+    """
+    Return a brief natural-language acknowledgement if this tool batch warrants one,
+    or empty string if the tools are fast enough that no ack is needed.
+
+    Rules:
+    - 0 slow tools AND only 1 tool → no ack (fast path, just show tool label)
+    - Any slow tool OR 2+ inline tools → ack
+    Ack text is picked by dominant tool category, in SOFi's voice.
+    """
+    names = [tc.name for tc in tool_calls]
+
+    slow_count = sum(1 for n in names if n in _SLOW_TOOLS)
+    total_count = len(names)
+
+    if slow_count == 0 and total_count < 2:
+        return ""  # fast single tool — no ack needed
+
+    # Pick the right ack by what's happening
+    has_web    = any(n in ("web_search", "web_fetch", "get_weather") for n in names)
+    has_write  = any(n in ("write_file", "patch_file") for n in names)
+    has_exec   = any(n in ("run_command", "run_python") for n in names)
+
+    if total_count >= 3:
+        return "Working on it — this'll take a moment."
+    if total_count >= 2:
+        return "Give me a moment."
+    if has_web:
+        return "Checking that now."
+    if has_write:
+        return "On it."
+    if has_exec:
+        return "Running that."
+    return "On it."
+
+
 def _tool_display_name(tool_name: str, is_background: bool = False) -> str:
     """Human-readable tool label for inline display."""
     labels = {
@@ -962,9 +1155,16 @@ def _tool_display_name(tool_name: str, is_background: bool = False) -> str:
         "read_file":            "reading file...",
         "list_directory":       "browsing directory...",
         "search_files":         "searching files...",
+        "write_file":           "writing file...",
+        "patch_file":           "editing file...",
         # Real execution tools
         "run_command":          "running command...",
         "run_python":           "running Python...",
+        # Sub-agents
+        "spawn_agent":          "delegating to sub-agent...",
+        # Skills
+        "skills_list":          "checking skills...",
+        "skills_load":          "loading skill...",
         # Background tools
         "write_report":         "writing report... ⟳",
         "save_note":            "saving note... ⟳",

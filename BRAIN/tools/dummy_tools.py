@@ -206,3 +206,7 @@ def register_dummy_tools(registry: ToolRegistry) -> None:
         capability_description="Check Zafar's calendar and schedule.",
     ))
 
+
+
+# Auto-discovery alias — brain.py looks for register(registry)
+register = register_dummy_tools
