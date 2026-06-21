@@ -66,7 +66,7 @@ def register_skill_tools(registry) -> None:
         handler=skills_list,
         category="skills",
         capability_name="skills_list",
-        capability_description="Discover available built-in skill playbooks.",
+        capability_description="Before any structured multi-step task (briefing, code review, research), check if a skill playbook exists for it.",
         capability_refusal="I can't list skills right now.",
     ))
 
@@ -90,7 +90,7 @@ def register_skill_tools(registry) -> None:
         handler=skills_load,
         category="skills",
         capability_name="skills_load",
-        capability_description="Load detailed instructions for a specific built-in skill.",
+        capability_description="Load the step-by-step playbook for a skill found via skills_list, then follow it.",
         capability_refusal="I can't load skills right now.",
     ))
 

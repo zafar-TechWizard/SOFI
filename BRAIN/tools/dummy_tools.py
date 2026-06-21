@@ -108,7 +108,7 @@ def register_dummy_tools(registry: ToolRegistry) -> None:
 
     registry.register(ToolEntry(
         name="check_emails",
-        description="Read emails from Zafar's inbox. Can filter by search query.",
+        description="Read emails from Zafar's inbox. Can filter by search query. (Demo — returns sample data; real Gmail connection pending OAuth setup.)",
         schema={
             "type": "object",
             "properties": {
@@ -132,7 +132,7 @@ def register_dummy_tools(registry: ToolRegistry) -> None:
 
     registry.register(ToolEntry(
         name="send_email",
-        description="Send an email on Zafar's behalf. Use only when he explicitly asks to send.",
+        description="Send an email on Zafar's behalf. Use only when he explicitly asks to send. (Demo — simulates send; real Gmail connection pending OAuth setup.)",
         schema={
             "type": "object",
             "properties": {
@@ -151,7 +151,7 @@ def register_dummy_tools(registry: ToolRegistry) -> None:
 
     registry.register(ToolEntry(
         name="check_whatsapp",
-        description="Check recent WhatsApp messages. Can filter by contact name.",
+        description="Check recent WhatsApp messages. Can filter by contact name. (Demo — returns sample data; no official WhatsApp personal API exists yet.)",
         schema={
             "type": "object",
             "properties": {
@@ -170,7 +170,7 @@ def register_dummy_tools(registry: ToolRegistry) -> None:
 
     registry.register(ToolEntry(
         name="send_whatsapp",
-        description="Send a WhatsApp message to a contact. Use only when Zafar explicitly asks.",
+        description="Send a WhatsApp message to a contact. Use only when Zafar explicitly asks. (Demo — simulates send; no official WhatsApp personal API exists yet.)",
         schema={
             "type": "object",
             "properties": {
@@ -188,7 +188,7 @@ def register_dummy_tools(registry: ToolRegistry) -> None:
 
     registry.register(ToolEntry(
         name="check_calendar",
-        description="Check Zafar's calendar events for a given date.",
+        description="Check Zafar's calendar events for a given date. (Demo — returns sample data; real Google Calendar connection pending OAuth setup.)",
         schema={
             "type": "object",
             "properties": {

@@ -66,7 +66,7 @@ def register_agent_tools(registry, llm) -> None:
         handler=spawn_agent,
         category="agents",
         capability_name="spawn_agent",
-        capability_description="Delegate complex multi-step tasks to specialized sub-agents.",
+        capability_description="For research or file/code tasks needing 4+ tool calls, spawn a sub-agent — it runs them independently and returns a summary, faster than doing it turn by turn.",
         capability_refusal="I can't spawn sub-agents right now.",
     ))
 

@@ -75,6 +75,24 @@ def _user_state_block(user_state) -> str:
     return _section("WHAT'S TRUE FOR ZAFAR RIGHT NOW", "\n".join(lines))
 
 
+def _orchestration_block() -> str:
+    """
+    Brief meta-guidance on when to use skills and sub-agents.
+    Injected once per turn so SOFi knows the pattern without it being buried
+    in the 'What I can do' list.
+    Only a few lines — no token waste.
+    """
+    return _section(
+        "HOW I APPROACH COMPLEX TASKS",
+        "When Zafar asks for something structured (a briefing, a code review, deep research, "
+        "or any multi-step task with a name): I first call skills_list to see if I have a "
+        "playbook for it, then skills_load to get the instructions before I start.\n"
+        "When a task needs 4+ sequential tool calls (deep research, series of file edits): "
+        "I use spawn_agent with the right agent type — it runs them as a focused sub-agent "
+        "and returns a summary, which I then synthesise in my own voice.",
+    )
+
+
 def _memory_blocks(memory_state) -> str:
     """Compose must_know / context / associations sections — skipping empty ones."""
     if memory_state is None:
@@ -198,6 +216,7 @@ def build_prompt(
         _current_moment_block(sofi_state),
         _user_state_block(user_state),
         _action_state_block(action_state),
+        _orchestration_block(),
         _memory_blocks(mem_state),
         _OUTPUT_CONTRACT,  # Always last — freshest instruction before generation starts
     ]

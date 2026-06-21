@@ -352,30 +352,19 @@ def register_background_tools(registry: ToolRegistry) -> None:
 
     registry.register(ToolEntry(
         name="simulate_slow_search",
-        description=(
-            "Simulate a slow background research operation (for testing the fire-and-forget pattern). "
-            "depth='normal' takes ~1.5s, depth='deep' takes ~3s. "
-            "Use this to test that SOFi continues conversing while research runs in background."
-        ),
+        description="[TEST TOOL — not for production use]",
         schema={
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Research query.",
-                },
-                "depth": {
-                    "type": "string",
-                    "enum": ["normal", "deep"],
-                    "description": "How thorough: 'normal' (~1.5s) or 'deep' (~3s).",
-                    "default": "normal",
-                },
+                "query": {"type": "string"},
+                "depth": {"type": "string", "enum": ["normal", "deep"], "default": "normal"},
             },
             "required": ["query"],
         },
         handler=simulate_slow_search,
         background=True,
-        category="information",
+        category="debug",
+        check_fn=lambda: False,  # hidden from LLM — dev/test tool only
         capability_name="background_research",
         capability_description="Run a research query in the background while conversing.",
     ))
