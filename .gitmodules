@@ -1,0 +1,4 @@
+[submodule "memory"]
+	path = memory
+	url = https://github.com/zafar-TechWizard/Assistant-Memory-System.git
+	branch = prod

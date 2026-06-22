@@ -1,0 +1,36 @@
+name: Sync Memory Submodule
+
+# Fires when memory repo pushes to prod (via repository_dispatch).
+# Can also be triggered manually from the GitHub Actions tab.
+on:
+  repository_dispatch:
+    types: [memory-updated]
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout SOFI with submodules
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Update memory submodule to latest prod
+        run: |
+          git submodule update --remote --merge memory
+
+      - name: Commit and push if submodule changed
+        run: |
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add memory
+          git diff --staged --quiet && echo "Already up to date — nothing to commit." || (
+            git commit -m "chore: sync memory submodule to latest prod" &&
+            git push
+          )
