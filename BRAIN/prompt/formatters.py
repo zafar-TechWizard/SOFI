@@ -19,6 +19,10 @@ _INTERNAL_KEYS = frozenset({
     "last_accessed", "content_vector", "rel_type",
 })
 
+# Hard cap on per-memory content length (chars). Prevents a single verbose
+# memory from blowing the token budget.
+_MAX_CONTENT_CHARS = 200
+
 
 def _parse_ts(raw) -> Optional[datetime]:
     if not raw:
@@ -81,6 +85,10 @@ def format_memory(m: Dict) -> str:
     name = m.get("person_name") or m.get("concept")
     if name and name.lower() not in content.lower():
         content = f"{name}: {content}" if content else name
+
+    # Hard cap — prevents verbose memories from blowing the token budget.
+    if len(content) > _MAX_CONTENT_CHARS:
+        content = content[:_MAX_CONTENT_CHARS - 3].rsplit(" ", 1)[0] + "..."
 
     # Clean trailing punctuation duplication
     content = content.rstrip(".")

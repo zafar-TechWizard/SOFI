@@ -2,11 +2,15 @@
 BRAIN/tools/dummy_tools.py — Communication stub tools
 
 get_current_time  : Real — returns actual current time
-check_emails      : Stub — needs Gmail OAuth to go live
-send_email        : Stub — needs Gmail OAuth to go live
-check_whatsapp    : Stub — no official personal WhatsApp API
-send_whatsapp     : Stub — no official personal WhatsApp API
-check_calendar    : Stub — needs Google Calendar OAuth to go live
+check_emails      : NOT CONNECTED — needs Gmail OAuth; registered as unavailable
+send_email        : NOT CONNECTED — needs Gmail OAuth; registered as unavailable
+check_whatsapp    : NOT CONNECTED — no official personal WhatsApp API; registered as unavailable
+send_whatsapp     : NOT CONNECTED — no official personal WhatsApp API; registered as unavailable
+check_calendar    : NOT CONNECTED — needs Google Calendar OAuth; registered as unavailable
+
+Unavailable tools are registered into SelfModel with available=False so SOFi
+knows they exist and can say "not connected yet" honestly. They are NOT passed
+to the LLM as callable tools (check_fn=lambda: False keeps them out of get_definitions()).
 
 Real web/filesystem/execution tools live in web_tools.py, fs_tools.py, exec_tools.py.
 """
@@ -108,7 +112,7 @@ def register_dummy_tools(registry: ToolRegistry) -> None:
 
     registry.register(ToolEntry(
         name="check_emails",
-        description="Read emails from Zafar's inbox. Can filter by search query. (Demo — returns sample data; real Gmail connection pending OAuth setup.)",
+        description="Read emails from Zafar's inbox.",
         schema={
             "type": "object",
             "properties": {
@@ -125,14 +129,16 @@ def register_dummy_tools(registry: ToolRegistry) -> None:
             "required": [],
         },
         handler=check_emails,
+        check_fn=lambda: False,
         category="communication",
         capability_name="email_read",
         capability_description="Read and search Zafar's emails.",
+        capability_refusal="My email isn't connected yet — Gmail OAuth still pending.",
     ))
 
     registry.register(ToolEntry(
         name="send_email",
-        description="Send an email on Zafar's behalf. Use only when he explicitly asks to send. (Demo — simulates send; real Gmail connection pending OAuth setup.)",
+        description="Send an email on Zafar's behalf.",
         schema={
             "type": "object",
             "properties": {
@@ -143,15 +149,17 @@ def register_dummy_tools(registry: ToolRegistry) -> None:
             "required": ["to", "subject", "body"],
         },
         handler=send_email,
+        check_fn=lambda: False,
         needs_confirmation=True,
         category="communication",
         capability_name="email_send",
         capability_description="Send emails on Zafar's behalf.",
+        capability_refusal="I can't send email yet — not connected to Gmail.",
     ))
 
     registry.register(ToolEntry(
         name="check_whatsapp",
-        description="Check recent WhatsApp messages. Can filter by contact name. (Demo — returns sample data; no official WhatsApp personal API exists yet.)",
+        description="Check recent WhatsApp messages.",
         schema={
             "type": "object",
             "properties": {
@@ -163,14 +171,16 @@ def register_dummy_tools(registry: ToolRegistry) -> None:
             "required": [],
         },
         handler=check_whatsapp,
+        check_fn=lambda: False,
         category="communication",
         capability_name="whatsapp_read",
         capability_description="Read Zafar's WhatsApp messages.",
+        capability_refusal="WhatsApp isn't wired up yet — there's no official API for personal accounts.",
     ))
 
     registry.register(ToolEntry(
         name="send_whatsapp",
-        description="Send a WhatsApp message to a contact. Use only when Zafar explicitly asks. (Demo — simulates send; no official WhatsApp personal API exists yet.)",
+        description="Send a WhatsApp message to a contact.",
         schema={
             "type": "object",
             "properties": {
@@ -180,15 +190,17 @@ def register_dummy_tools(registry: ToolRegistry) -> None:
             "required": ["contact", "message"],
         },
         handler=send_whatsapp,
+        check_fn=lambda: False,
         needs_confirmation=True,
         category="communication",
         capability_name="whatsapp_send",
         capability_description="Send WhatsApp messages on Zafar's behalf.",
+        capability_refusal="Can't send WhatsApp messages yet — not connected.",
     ))
 
     registry.register(ToolEntry(
         name="check_calendar",
-        description="Check Zafar's calendar events for a given date. (Demo — returns sample data; real Google Calendar connection pending OAuth setup.)",
+        description="Check Zafar's calendar events for a given date.",
         schema={
             "type": "object",
             "properties": {
@@ -201,9 +213,11 @@ def register_dummy_tools(registry: ToolRegistry) -> None:
             "required": [],
         },
         handler=check_calendar,
+        check_fn=lambda: False,
         category="information",
         capability_name="calendar_read",
         capability_description="Check Zafar's calendar and schedule.",
+        capability_refusal="My calendar access isn't connected yet — Google Calendar OAuth still pending.",
     ))
 
 

@@ -36,6 +36,7 @@ from google import genai
 from google.genai import types
 
 from BRAIN.llm.groq_client import LLMResponse, LLMToolCall
+from BRAIN.llm.retry_utils import jittered_backoff
 
 
 _log = logging.getLogger("sofi.brain.gemini")
@@ -99,14 +100,14 @@ class GeminiClient:
     """
 
     DEFAULT_MODEL = GEMINI_31_FLASH_LITE
-    MAX_RETRIES = 90
+    MAX_RETRIES = 3
 
     def __init__(
         self,
         model: Optional[str] = None,
         api_key: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 1024,
+        max_tokens: int = 8192,
     ):
         self.model = model or self.DEFAULT_MODEL
         self.temperature = temperature
@@ -165,10 +166,10 @@ class GeminiClient:
                 if classified in ("auth", "format_error", "content_filter"):
                     raise
                 if classified == "rate_limit" and attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(jittered_backoff(attempt, base_delay=3.0))
                     continue
                 if classified in ("server_error", "timeout") and attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(1 + attempt)
+                    await asyncio.sleep(jittered_backoff(attempt, base_delay=1.0))
                     continue
                 raise
         if last_exc:
@@ -182,6 +183,7 @@ class GeminiClient:
         messages: List[Dict],
         tools: List[Dict[str, Any]],
         tool_choice: str = "auto",
+        max_tokens_override: Optional[int] = None,
     ) -> LLMResponse:
         """
         Call Gemini with tool definitions. Returns LLMResponse that may contain
@@ -194,7 +196,7 @@ class GeminiClient:
         config = types.GenerateContentConfig(
             system_instruction=system_prompt,
             temperature=self.temperature,
-            max_output_tokens=self.max_tokens,
+            max_output_tokens=max_tokens_override or self.max_tokens,
             tools=google_tools if google_tools else None,
             thinking_config=_thinking_config_for(self.model),
         )
@@ -223,10 +225,10 @@ class GeminiClient:
                 if classified in ("auth", "format_error", "content_filter"):
                     raise
                 if classified == "rate_limit" and attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(jittered_backoff(attempt, base_delay=3.0))
                     continue
                 if classified in ("server_error", "timeout") and attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(1 + attempt)
+                    await asyncio.sleep(jittered_backoff(attempt, base_delay=1.0))
                     continue
                 raise
         else:

@@ -1,6 +1,7 @@
 # SOFi — Project CLAUDE.md
 
 Read this first. This is the entry point for the entire workspace.
+IMPORTANT: kEEP IN MIND `/QWEN-CODE-MAIN`, `/HERMES-AGENT-MAIN`, `/GEMINI-CLI-MAIN`, `/CLAUDE-CODE-MAIN` these all directories are added here, from github, and these just fro the reference, specially pay very high attention to hermes agent and claude code, for the insperations only, because these are production tested and works already from so many time in production and have fix the isssues we have not got yet, take these as inperations when building anything new explore all option so we can plan correctly.
 
 ---
 

@@ -22,6 +22,8 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 from groq import AsyncGroq
 
+from BRAIN.llm.retry_utils import jittered_backoff
+
 
 @dataclass
 class LLMToolCall:
@@ -51,7 +53,7 @@ class GroqClient:
         model: Optional[str] = None,
         api_key: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 1024,
+        max_tokens: int = 8192,
     ):
         self.model = model or self.DEFAULT_MODEL
         self.temperature = temperature
@@ -103,6 +105,7 @@ class GroqClient:
         messages: List[Dict],
         tools: List[Dict[str, Any]],
         tool_choice: str = "auto",
+        max_tokens_override: Optional[int] = None,
     ) -> LLMResponse:
         """
         Call Groq with tool definitions. Returns structured response
@@ -126,7 +129,7 @@ class GroqClient:
             "model": self.model,
             "messages": full_messages,
             "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            "max_tokens": max_tokens_override or self.max_tokens,
         }
         if tools:
             kwargs["tools"] = tools
@@ -143,10 +146,10 @@ class GroqClient:
                 if classified in ("content_policy", "auth", "billing", "format_error"):
                     raise
                 if classified == "rate_limit" and attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(jittered_backoff(attempt, base_delay=3.0))
                     continue
                 if classified in ("server_error", "overloaded", "timeout") and attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(1 + attempt)
+                    await asyncio.sleep(jittered_backoff(attempt, base_delay=1.0))
                     continue
                 raise
         else:

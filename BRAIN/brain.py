@@ -30,9 +30,11 @@ Public API:
 import asyncio
 import json
 import logging
+import threading
 import time
 from datetime import datetime
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set
+from pathlib import Path as _Path
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 from memory.memory_manager import MemoryManager
 from memory.working_memory.working_context import (
@@ -45,6 +47,9 @@ from memory.working_memory.working_context import (
 import os
 
 from BRAIN.llm import GeminiClient, GroqClient
+from BRAIN.context_compression import compress_loop_messages
+from BRAIN.llm.error_classifier import classify_error, ErrorReason
+from BRAIN.llm.retry_utils import jittered_backoff
 from BRAIN.mode import Mode, ModeController
 from BRAIN.persona.persona import (
     DEFAULT_MODE,
@@ -53,6 +58,7 @@ from BRAIN.persona.persona import (
     warm_cache,
 )
 from BRAIN.prompt import build_messages, build_prompt
+from BRAIN.prompt.token_estimator import check_budget
 from BRAIN.state import SelfModel, UserStateInferencer, UserStateUpdate
 from BRAIN.tools.registry import ToolCall, ToolRegistry, ToolResult
 
@@ -61,6 +67,8 @@ _log = logging.getLogger("sofi.brain")
 
 ProgressFn = Callable[[str], None]
 ToolEventFn = Optional[Callable[[str, Dict[str, Any]], None]]
+# Confirmation callback: (tool_name, question) → bool (True = approved)
+ConfirmFn = Optional[Callable[[str, str], Awaitable[bool]]]
 
 
 def _time_ago(dt: datetime) -> str:
@@ -114,9 +122,21 @@ class Brain:
         self._tool_registry: ToolRegistry = ToolRegistry()
         self._last_tool_calls: List[Dict[str, Any]] = []
         self._on_tool_event: ToolEventFn = None
+        self._confirmation_fn: ConfirmFn = None
 
         # Background task tracking — keeps asyncio tasks alive until done
         self._background_tasks: Set[asyncio.Task] = set()
+
+        # Sub-agent infrastructure
+        from BRAIN.agents.registry import ActiveRegistry
+        from BRAIN.agents.heartbeat import HeartbeatMonitor
+        self._active_registry = ActiveRegistry()
+        self._heartbeat = HeartbeatMonitor(self._active_registry)
+
+        # Proactive notification queue — populated by WorkspaceWatcher daemon thread
+        # when a background agent completes with INFORM: true
+        self._proactive_lock = threading.Lock()
+        self._proactive_items: List[Any] = []
 
     # =========================================================================
     # Lifecycle
@@ -128,6 +148,7 @@ class Brain:
             return
         await self._setup_core(on_progress)
         await self._setup_memory(on_progress)
+        self._preflight_check(on_progress)
 
     async def _setup_core(self, on_progress: Optional[ProgressFn] = None) -> None:
         """
@@ -160,7 +181,17 @@ class Brain:
         self._tool_registry = ToolRegistry()
         _auto_register_tools(self._tool_registry)
         from BRAIN.tools._agent_tools import register_agent_tools
-        register_agent_tools(self._tool_registry, self._llm)
+        register_agent_tools(
+            self._tool_registry,
+            self._llm,
+            get_workspace=self._get_workspace,
+            register_bg_task=lambda t: (
+                self._background_tasks.add(t),
+                t.add_done_callback(self._background_tasks.discard),
+            ),
+            active_registry=self._active_registry,
+        )
+        self._heartbeat.start()
         self._tool_registry.sync_with_self_model(self._self_model)
         set_self_model(self._self_model)
         warm_cache()
@@ -192,8 +223,51 @@ class Brain:
         self._memory = MemoryManager(log=self._mem_log, review=self._mem_review)
         await self._memory.setup()
 
+        # Wire brain's proactive callback into the memory system's WorkspaceWatcher.
+        # Must happen after setup() because the watcher is created inside setup().
+        # The lambda avoids a direct reference cycle: brain → memory → brain.
+        _brain_ref = self
+        self._memory._on_proactive_notification = lambda item: _brain_ref._on_proactive_notification(item)
+
         _tick("ready")
         self._is_ready = True
+
+    def _preflight_check(self, on_progress: Optional[ProgressFn] = None) -> None:
+        """
+        Validate all subsystems are operational after setup.
+        Logs warnings for degraded subsystems but doesn't block startup.
+        """
+        issues = []
+
+        if self._llm is None:
+            issues.append("LLM client not initialized")
+        if self._memory is None:
+            issues.append("Memory system not initialized")
+        if self._self_model is None:
+            issues.append("SelfModel not initialized")
+        if self._tool_registry.tool_count == 0:
+            issues.append("No tools registered")
+
+        available_tools = len(self._tool_registry.get_available_tools())
+        if available_tools == 0 and self._tool_registry.tool_count > 0:
+            issues.append(f"All {self._tool_registry.tool_count} tools unavailable")
+
+        if issues:
+            for issue in issues:
+                _log.warning("preflight | %s", issue)
+            if on_progress:
+                try:
+                    on_progress(f"warnings: {', '.join(issues)}")
+                except Exception:
+                    pass
+        else:
+            _log.info(
+                "preflight | all systems nominal | llm=%s tools=%d/%d memory=%s",
+                type(self._llm).__name__,
+                available_tools,
+                self._tool_registry.tool_count,
+                "ok" if self._memory else "none",
+            )
 
     async def hot_reload(self) -> "Brain":
         """
@@ -225,6 +299,12 @@ class Brain:
             "BRAIN.llm",
             "BRAIN.tools.registry",
             "BRAIN.tools",
+            "BRAIN.agents.budget",
+            "BRAIN.agents.result",
+            "BRAIN.agents.safety",
+            "BRAIN.agents.registry",
+            "BRAIN.agents.heartbeat",
+            "BRAIN.agents.runner",
             "BRAIN.agents.definitions",
             "BRAIN.agents.orchestrator",
             "BRAIN.agents",
@@ -276,6 +356,16 @@ class Brain:
         new_brain._prev_was_override = self._prev_was_override
         new_brain._forced_mode = self._forced_mode
 
+        # Carry over sub-agent infrastructure — live agents must survive reload.
+        new_brain._active_registry = self._active_registry
+        new_brain._heartbeat = self._heartbeat
+        new_brain._background_tasks = self._background_tasks
+
+        # Carry over CLI-wired callbacks — these are closures on the terminal
+        # session and console, which survive across reloads unchanged.
+        new_brain._confirmation_fn = self._confirmation_fn
+        new_brain._on_tool_event = self._on_tool_event
+
         # Run the fast path only — persona + LLM + tools (~2-3s, no Docker).
         await new_brain._setup_core()
         new_brain._is_ready = True
@@ -287,6 +377,10 @@ class Brain:
         return new_brain
 
     async def shutdown(self) -> None:
+        # Stop heartbeat monitor and interrupt all active sub-agents
+        self._heartbeat.stop()
+        self._active_registry.interrupt_all()
+
         # Wait briefly for any in-flight background tasks
         if self._background_tasks:
             _log.info("shutdown | waiting for %d background tasks", len(self._background_tasks))
@@ -300,9 +394,19 @@ class Brain:
                 for t in self._background_tasks:
                     t.cancel()
 
+        # Clean up old .temp/ files from sub-agent outputs.
+        _cleanup_temp_files()
+
+        # Clean up old task files on disk.
+        tm = self._get_task_manager()
+        if tm:
+            try:
+                tm.cleanup()
+            except Exception:
+                pass
+
         # Auto-run consolidation in background on shutdown so memories accumulate
         # without Zafar having to remember to run it manually.
-        # Runs in a daemon thread so it doesn't block the shutdown sequence.
         _trigger_consolidation_on_shutdown()
 
         if self._memory:
@@ -323,20 +427,36 @@ class Brain:
         self._local_history.append({"role": "user", "content": message})
         self._local_history = self._local_history[-self.MAX_LOCAL_TURNS:]
 
-        # ─── PHASE A: Context gathering (unchanged) ───
-        await self._memory.observe("user", message)
-        await self._memory.get_context_async("user", message)
-        ctx = self._memory.get_full_context()
-
-        # ─── PHASE B: State + Mode inference (unchanged) ───
-        user_state = self._user_state_inferencer.infer(
-            ctx, message, prev_state=self._prev_user_state,
-        )
+        # ─── PHASE A: Context gathering ───
+        # Wrapped in try/except so SOFi degrades to conversation-only if
+        # memory is unavailable (Neo4j down, GLiNER crash, Docker stopped).
+        _memory_ok = True
         try:
-            self._memory.context_manager.update_user_state(**user_state.as_dict())
+            await self._memory.observe("user", message)
+            await self._memory.get_context_async("user", message)
             ctx = self._memory.get_full_context()
-        except Exception:
-            pass
+        except Exception as mem_exc:
+            _log.warning(
+                "process | memory unavailable — degrading to conversation-only | %s",
+                mem_exc,
+            )
+            _memory_ok = False
+            ctx = None
+
+        # ─── PHASE B: State + Mode inference ───
+        if _memory_ok and ctx is not None:
+            user_state = self._user_state_inferencer.infer(
+                ctx, message, prev_state=self._prev_user_state,
+            )
+            try:
+                self._memory.context_manager.update_user_state(**user_state.as_dict())
+                ctx = self._memory.get_full_context()
+            except Exception:
+                pass
+        else:
+            user_state = self._user_state_inferencer.infer(
+                None, message, prev_state=self._prev_user_state,
+            )
         self._prev_user_state = user_state
         self._last_user_state = user_state.as_dict()
 
@@ -377,19 +497,46 @@ class Brain:
             list(action_state.keys()) if action_state else [],
         )
 
+        # Lazy-import skills registry — avoids circular import and only loads
+        # if the module is available.
+        _skills_reg = None
+        try:
+            from BRAIN.skills._registry import get_registry
+            _skills_reg = get_registry()
+        except Exception:
+            pass
+
         system_prompt = build_prompt(
             ctx,
             mode=decision.mode.value,
             allow_dropped_formality=decision.allow_dropped_formality,
             action_state=action_state,
+            self_model=self._self_model,
+            skills_registry=_skills_reg,
         )
 
-        messages = build_messages(ctx, message)
-        memory_recent = getattr(getattr(ctx, "memory", None), "recent_turns", None)
-        if not memory_recent:
+        if _memory_ok and ctx is not None:
+            messages = build_messages(ctx, message)
+            memory_recent = getattr(getattr(ctx, "memory", None), "recent_turns", None)
+            if not memory_recent:
+                messages = list(self._local_history)
+        else:
             messages = list(self._local_history)
 
         tool_defs = self._tool_registry.get_definitions()
+
+        # ─── Token budget check ───
+        # Trim oldest messages (keeping the current user message) if the
+        # prompt + messages exceed the context window.
+        fits, est_tokens, _ = check_budget(system_prompt, messages)
+        if not fits and len(messages) > 2:
+            _log.warning(
+                "process | token budget exceeded (%d est.) — trimming messages",
+                est_tokens,
+            )
+            while not fits and len(messages) > 2:
+                messages.pop(0)
+                fits, est_tokens, _ = check_budget(system_prompt, messages)
 
         # ─── PHASE D: THE AGENTIC LOOP ───
         # Inline tools: await result → LLM sees it immediately → continues.
@@ -402,9 +549,16 @@ class Brain:
         display_text = ""
         response_text = ""
         iteration = 0
+        _continuation_count = 0
+        _exit_reason = "normal"
+        _tools_executed = 0
+        _loop_start = time.perf_counter()
+        _spill_dir = _Path(__file__).parent.parent / ".temp"
+
+        MAX_CONTINUATIONS = 3
+        PROGRESSIVE_MAX_TOKENS = [8192, 12288, 16384]
 
         if not tool_defs:
-            # No tools registered — pure conversation, stream directly.
             _log.debug("process | no tools registered — pure conversation stream")
             async for token in self._llm.stream(system_prompt, messages):
                 response_text += token
@@ -416,76 +570,86 @@ class Brain:
                 iteration += 1
                 _log.debug("process | agentic loop iter=%d", iteration)
 
-                try:
-                    response = await self._llm.call_with_tools(
-                        system_prompt, messages, tool_defs,
-                    )
-                except Exception as exc:
-                    error_class = self._llm._classify_error(exc)
-                    _log.warning(
-                        "process | LLM error | class=%s | exc=%s",
-                        error_class, exc, exc_info=True,
-                    )
-                    # Always surface errors — silent failures are worse than noisy ones.
-                    if error_class == "rate_limit":
-                        error_msg = (
-                            "\n\nI've hit a rate limit. Give it a moment and try again, sir."
-                        )
-                    elif error_class == "auth":
-                        error_msg = "\n\nAPI key issue — check gemini_api_key in .env."
-                    elif error_class == "content_filter":
-                        error_msg = "\n\nMy response was blocked by a content filter. Try rephrasing."
-                    else:
-                        error_msg = (
-                            f"\n\nSomething went wrong on my end ({error_class}): {exc}"
-                        )
-                    response_text += error_msg
-                    yield error_msg
+                # ── Per-iteration budget check ──
+                messages = compress_loop_messages(
+                    messages,
+                    system_prompt_chars=len(system_prompt),
+                )
+
+                # ── Grace call on last iteration ──
+                current_tool_defs = tool_defs
+                if iteration >= self.MAX_TOOL_ITERATIONS:
+                    _log.info("process | grace call — last iteration, removing tools")
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "This is your last iteration. Give a complete response "
+                            "now. Do not call more tools."
+                        ),
+                    })
+                    current_tool_defs = []
+
+                # ── LLM call with retry ──
+                max_tok = PROGRESSIVE_MAX_TOKENS[
+                    min(_continuation_count, len(PROGRESSIVE_MAX_TOKENS) - 1)
+                ] if _continuation_count > 0 else None
+
+                response, error_msg = await self._call_llm_with_retry(
+                    system_prompt, messages, current_tool_defs,
+                    max_tokens_override=max_tok,
+                )
+
+                if error_msg is not None:
+                    _exit_reason = "llm_error"
+                    error_text = f"\n\n{error_msg}"
+                    response_text += error_text
+                    yield error_text
                     break
 
                 # ── CASE: finish_reason == "length" ──
                 if response.finish_reason == "length":
-                    _log.debug("process | finish_reason=length — continuing")
                     if response.text:
                         response_text += response.text
                         yield response.text
+
+                    _continuation_count += 1
+                    if _continuation_count >= MAX_CONTINUATIONS:
+                        _log.info(
+                            "process | max continuations reached (%d) — stopping",
+                            MAX_CONTINUATIONS,
+                        )
+                        _exit_reason = "max_continuations"
+                        break
+
+                    _log.debug(
+                        "process | finish_reason=length — continuing (%d/%d) max_tokens=%s",
+                        _continuation_count, MAX_CONTINUATIONS,
+                        PROGRESSIVE_MAX_TOKENS[min(_continuation_count, len(PROGRESSIVE_MAX_TOKENS) - 1)],
+                    )
                     messages.append({"role": "assistant", "content": response.text or ""})
                     messages.append({"role": "user", "content": "Please continue your response."})
                     continue
 
+                # ── CASE: content filter ──
+                if response.finish_reason == "content_filter":
+                    _exit_reason = "content_filter"
+                    _log.warning("process | content filter stop")
+                    break
+
                 # ── CASE: tool_calls present ──
                 if response.tool_calls:
-                    # Suppress response.text here — when a model makes tool calls it
-                    # often emits chain-of-thought reasoning as the text part ("The user
-                    # wants to... I should..."). Showing that breaks persona and feels like
-                    # a chatbot narrating itself. Tool labels ("`reading emails...`") already
-                    # tell the user what's happening. The clean final response comes after
-                    # inline tools execute and we loop back.
                     if response.text:
                         _log.debug(
                             "process | suppressing LLM reasoning text alongside tools | "
                             "len=%d preview=%.80s", len(response.text), response.text,
                         )
 
-                    # ── Acknowledgement-first for slow/multi-tool batches ──
-                    # Fast tools (read_file, list_directory, get_current_time) run
-                    # silently — they're quick enough that an ack would just be noise.
-                    # Slow tools (web_search, run_command, write_file, etc.) or batches
-                    # of 2+ tools get a brief ack so Zafar knows she's on it immediately,
-                    # before the work starts.
                     ack_text = _ack_for_tools(response.tool_calls)
                     if ack_text and iteration == 1:
-                        # Only ack on the FIRST iteration — subsequent tool rounds
-                        # are follow-up actions inside the same turn; no need to ack again.
                         display_text += ack_text
                         response_text += ack_text
                         yield ack_text
 
-                    # Build assistant message with tool_calls (Groq/OpenAI format).
-                    # For Gemini thinking models, also carry raw_content so that
-                    # _messages_to_contents can pass the original Content object back
-                    # to the API verbatim — preserving the thought_signature bytes
-                    # inside FunctionCall parts that the 400 error requires.
                     assistant_msg: Dict[str, Any] = {
                         "role": "assistant",
                         "content": response.text or None,
@@ -505,12 +669,10 @@ class Brain:
                         assistant_msg["_raw_content"] = response.raw_content
                     messages.append(assistant_msg)
 
-                    # ── Phase 1: Show all labels upfront + dispatch background tools ──
-                    # All tool labels appear immediately so Zafar sees the full
-                    # work plan before any tool has finished executing.
+                    # ── Phase 1: Show labels + dispatch background tools ──
                     had_inline = False
                     inline_tcs = []
-                    bg_dispatched: Dict[str, Any] = {}  # tc.id → workspace_item_id
+                    bg_dispatched: Dict[str, Any] = {}
 
                     for tc in response.tool_calls:
                         is_bg = self._tool_registry.is_background(tc.name)
@@ -546,11 +708,14 @@ class Brain:
                             had_inline = True
                             inline_tcs.append(tc)
 
+                    # ── Pre-flight safety check ──
+                    pre_blocked: Dict[str, ToolResult] = {}
+                    if inline_tcs:
+                        inline_tcs, pre_blocked = await self._pre_flight_check(inline_tcs)
+
                     # ── Phase 2: Execute all inline tools in parallel ──
-                    # asyncio.gather runs them concurrently; wall-clock time =
-                    # slowest single tool instead of sum of all tools.
-                    # return_exceptions=True prevents one failure from cancelling others.
-                    inline_results: Dict[str, Any] = {}  # tc.id → result | Exception
+                    inline_results: Dict[str, Any] = {}
+                    inline_results.update(pre_blocked)
 
                     if inline_tcs:
                         async def _exec_tc(tc):
@@ -566,6 +731,7 @@ class Brain:
 
                         for tc, result in zip(inline_tcs, gathered):
                             inline_results[tc.id] = result
+                            _tools_executed += 1
                             if isinstance(result, Exception):
                                 _log.error(
                                     "process | inline tool error | tool=%s exc=%s",
@@ -598,8 +764,8 @@ class Brain:
                                     "output_preview": result.output[:200] if result.output else "",
                                 })
 
-                    # ── Phase 3: Append tool messages in original tool_calls order ──
-                    # Preserving order keeps Groq and Gemini message history valid.
+                    # ── Phase 3: Append tool messages in order ──
+                    tool_msg_start_idx = len(messages)
                     for tc in response.tool_calls:
                         if tc.id in bg_dispatched:
                             messages.append({
@@ -622,19 +788,20 @@ class Brain:
                                     "content": result.to_string(),
                                 })
 
-                    # ── Decide whether to loop back ──
+                    # ── Turn budget enforcement (spill oversized results to disk) ──
+                    from BRAIN.tools.turn_budget import enforce_turn_budget
+                    messages = enforce_turn_budget(
+                        messages, tool_msg_start_idx, _spill_dir,
+                    )
+
                     if had_inline:
-                        # Inline tools ran — LLM needs to see their results.
-                        # Loop back for the follow-up response.
                         _log.debug("process | had inline tools — continuing loop")
                         continue
                     else:
-                        # All tools were background (fire-and-forget).
-                        # We suppressed response.text above (it was reasoning), so
-                        # always emit a brief acknowledgement so the turn isn't silent.
                         ack = "On it."
                         response_text += ack
                         yield ack
+                        _exit_reason = "all_background"
                         _log.debug(
                             "process | all-background turn — ending cleanly | "
                             "response_text_len=%d", len(response_text),
@@ -649,22 +816,55 @@ class Brain:
                     )
                     response_text += response.text
                     yield response.text
+                _exit_reason = "text_response"
                 break
 
-            # Safety: max iterations hit with no text response
-            if iteration >= self.MAX_TOOL_ITERATIONS and not response_text:
-                _log.warning("process | max_iterations=%d hit without text response", self.MAX_TOOL_ITERATIONS)
-                fallback = "I seem to have gotten caught in a loop, sir. Let me answer directly."
+            # Safety: loop exited with no text response
+            if not response_text:
+                if iteration >= self.MAX_TOOL_ITERATIONS:
+                    _exit_reason = "max_iterations"
+                    _log.warning("process | max_iterations=%d hit without text response", self.MAX_TOOL_ITERATIONS)
+                    fallback = "I seem to have gotten caught in a loop, sir. Let me answer directly."
+                else:
+                    _exit_reason = "empty_response"
+                    _log.warning("process | LLM returned empty response on iteration %d", iteration)
+                    fallback = "I didn't get a response from the model. Try again, sir."
                 response_text = fallback
                 yield fallback
+
+            # ── Loop summary log ──
+            _loop_duration = (time.perf_counter() - _loop_start) * 1000
+            _log.info(
+                "process | loop done | exit=%s iterations=%d tools=%d "
+                "continuations=%d duration_ms=%.0f",
+                _exit_reason, iteration, _tools_executed,
+                _continuation_count, _loop_duration,
+            )
 
         # ─── PHASE E: Post-response ───
         # Save only the LLM-generated text to memory (not tool status markers)
         if response_text:
-            await self._memory.observe("assistant", response_text)
+            if _memory_ok:
+                try:
+                    await self._memory.observe("assistant", response_text)
+                except Exception as mem_exc:
+                    _log.warning("process | failed to save response to memory | %s", mem_exc)
             self._local_history.append({"role": "assistant", "content": response_text})
             self._local_history = self._local_history[-self.MAX_LOCAL_TURNS:]
             _log.debug("process | response saved to memory | len=%d", len(response_text))
+
+        # ─── PHASE F: Mark delivered tasks ───
+        # If there were completed deliveries in the action_state and SOFi
+        # generated a response (meaning she delivered them), mark as delivered.
+        if response_text and action_state:
+            deliveries = action_state.get("deliveries") or []
+            tm = self._get_task_manager()
+            if tm and deliveries:
+                for d in deliveries:
+                    task_id = d.get("task_id")
+                    if task_id:
+                        tm.mark_delivered(task_id)
+                        _log.info("process | task marked delivered | id=%s", task_id)
 
     def clear_history(self) -> None:
         self._local_history.clear()
@@ -804,12 +1004,38 @@ class Brain:
             _log.warning("_get_workspace | error | %s", exc)
             return None
 
+    def _on_proactive_notification(self, item) -> None:
+        """
+        Called from WorkspaceWatcher daemon thread when a background agent
+        completes with INFORM: true. Thread-safe — stores item for CLI pickup.
+        """
+        _log.info(
+            "proactive | queued | id=%s title=%s",
+            item.id[:8], item.title,
+        )
+        with self._proactive_lock:
+            self._proactive_items.append(item)
+
+    def get_pending_proactive(self) -> list:
+        """
+        Non-blocking, thread-safe drain of pending proactive notifications.
+        Called by the CLI at the start of each main loop iteration.
+        """
+        with self._proactive_lock:
+            items = list(self._proactive_items)
+            self._proactive_items.clear()
+            return items
+
     # =========================================================================
     # Tool event callback — wired by CLI for live display
     # =========================================================================
 
     def set_tool_event_handler(self, handler: ToolEventFn) -> None:
         self._on_tool_event = handler
+
+    def set_confirmation_handler(self, handler: ConfirmFn) -> None:
+        """Wire the CLI's confirmation prompt into the agentic loop."""
+        self._confirmation_fn = handler
 
     def _emit_tool_event(self, event_type: str, data: Dict[str, Any]) -> None:
         if self._on_tool_event:
@@ -913,16 +1139,21 @@ class Brain:
     # Internals
     # =========================================================================
 
+    def _get_task_manager(self):
+        """Get the disk-backed TaskManager from the tool registry."""
+        return getattr(self._tool_registry, "_task_manager", None)
+
     def _get_action_state(self) -> Optional[Dict[str, Any]]:
         """
         Assemble the action state dict for prompt injection.
 
-        Reads from:
-          - self._last_tool_calls — inline tools that ran last turn
-          - AgenticWorkspace     — background tasks (in-progress + just completed)
+        Reads from THREE sources:
+          1. self._last_tool_calls — inline tools that ran last turn
+          2. AgenticWorkspace     — in-memory background task state
+          3. TaskManager (disk)   — task files with step progress + deliveries
 
-        Notifications are cleared (notify=False) after being surfaced so they
-        appear exactly once — SOFi sees and acknowledges them this turn only.
+        Task deliveries from disk are the primary source for completed work.
+        They include the full content that SOFi needs to deliver to Zafar.
         """
         state: Dict[str, Any] = {}
 
@@ -938,25 +1169,74 @@ class Brain:
             if completed:
                 state["completed"] = completed
 
-        # ── AgenticWorkspace: background tasks ──
-        ws = self._get_workspace()
-        if ws:
-            # Active background tasks (still running)
-            active_tasks = ws.get_active_tasks()
+        # ── Disk-backed tasks (primary source for delegated work) ──
+        tm = self._get_task_manager()
+        if tm:
+            # Active tasks with step-level progress
+            active_tasks = tm.get_active_tasks()
             if active_tasks:
-                state["active"] = [
-                    {
-                        "title": item.title,
-                        "ago": _time_ago(item.created_at),
+                state["active_tasks"] = []
+                for t in active_tasks[:5]:
+                    entry: Dict[str, Any] = {
+                        "task_id": t.task_id,
+                        "agent": t.agent_type,
+                        "query": t.original_query[:120],
+                        "status": t.status,
                     }
-                    for item in active_tasks[:3]
-                ]
-                _log.debug(
-                    "_get_action_state | active background tasks: %s",
-                    [t.title for t in active_tasks],
+                    if t.total_steps > 0:
+                        entry["progress"] = f"step {t.current_step + 1}/{t.total_steps}"
+                        current = t.steps[t.current_step] if t.current_step < len(t.steps) else None
+                        if current:
+                            entry["current_action"] = current.get("action", "")
+                            entry["detail"] = current.get("detail", "")[:100]
+                    state["active_tasks"].append(entry)
+
+            # Completed deliveries — SOFi must deliver these to Zafar
+            ready = tm.get_completed_undelivered()
+            if ready:
+                state["deliveries"] = []
+                for t in ready[:3]:
+                    delivery = t.delivery or {}
+                    state["deliveries"].append({
+                        "task_id": t.task_id,
+                        "agent": t.agent_type,
+                        "original_query": t.original_query,
+                        "delivery_status": delivery.get("status", "unknown"),
+                        "summary": delivery.get("summary", ""),
+                        "content": delivery.get("content", ""),
+                        "gaps": delivery.get("gaps"),
+                    })
+                _log.info(
+                    "_get_action_state | %d deliveries ready: %s",
+                    len(ready),
+                    [t.task_id for t in ready],
                 )
 
-            # Background tasks that just completed — surface to SOFi this turn
+            # Recently delivered — content SOFi already presented but may
+            # need to reference again (e.g. "write that to a file").
+            # Shows summary + content so SOFi can act on follow-up requests.
+            recent = tm.get_recently_delivered(max_age_minutes=30)
+            if recent:
+                state["recent_deliveries"] = []
+                for t in recent[:3]:
+                    delivery = t.delivery or {}
+                    state["recent_deliveries"].append({
+                        "task_id": t.task_id,
+                        "agent": t.agent_type,
+                        "original_query": t.original_query,
+                        "summary": delivery.get("summary", ""),
+                        "content": delivery.get("content", ""),
+                    })
+
+        # ── Active sub-agents (real-time from registry) ──
+        if self._active_registry.active_count() > 0:
+            snap = self._active_registry.snapshot()
+            state["live_agents"] = snap["active"]
+            state["agent_slots"] = snap["slots"]
+
+        # ── AgenticWorkspace: legacy background tasks ──
+        ws = self._get_workspace()
+        if ws:
             notifications = ws.get_pending_notifications()
             if notifications:
                 state["notifications"] = [
@@ -966,28 +1246,161 @@ class Brain:
                             f"{'done' if item.status == WorkspaceItemStatus.COMPLETED else 'failed'}: "
                             f"{item.description[:150]}"
                         ),
+                        "agent_type": (item.metadata or {}).get("agent_type", ""),
                     }
                     for item in notifications[:3]
                 ]
-                _log.info(
-                    "_get_action_state | surfacing %d background notifications: %s",
-                    len(notifications),
-                    [n.title for n in notifications],
-                )
-
-                # Clear notifications so they don't repeat next turn
                 for item in notifications:
                     ws.update_item(item.id, notify=False)
-                    _log.debug(
-                        "_get_action_state | notification cleared | id=%s title=%s",
-                        item.id[:8], item.title,
-                    )
 
         if not state:
             return None
 
         _log.debug("_get_action_state | state_keys=%s", list(state.keys()))
         return state
+
+    async def _call_llm_with_retry(
+        self,
+        system_prompt: str,
+        messages: List[Dict],
+        tool_defs: List[Dict],
+        max_tokens_override: Optional[int] = None,
+    ) -> Tuple[Any, Optional[str]]:
+        """
+        Call LLM with structured retry and context-overflow recovery.
+
+        Returns (LLMResponse, error_msg). error_msg is None on success.
+        On non-recoverable errors, LLMResponse is None and error_msg is set.
+        """
+        MAX_ATTEMPTS = 3
+
+        for attempt in range(MAX_ATTEMPTS):
+            try:
+                response = await self._llm.call_with_tools(
+                    system_prompt, messages, tool_defs,
+                    max_tokens_override=max_tokens_override,
+                )
+                return response, None
+
+            except Exception as exc:
+                classified = classify_error(exc)
+                _log.warning(
+                    "_call_llm_with_retry | attempt=%d reason=%s retryable=%s | %s",
+                    attempt + 1, classified.reason.value, classified.retryable, exc,
+                )
+
+                if not classified.retryable:
+                    return None, classified.user_message
+
+                if classified.should_trim_context:
+                    messages = compress_loop_messages(
+                        messages,
+                        system_prompt_chars=len(system_prompt),
+                    )
+                    continue
+
+                if classified.reason in (
+                    ErrorReason.RATE_LIMIT, ErrorReason.OVERLOADED,
+                ):
+                    delay = jittered_backoff(attempt, base_delay=3.0)
+                elif classified.reason in (
+                    ErrorReason.SERVER_ERROR, ErrorReason.TIMEOUT,
+                ):
+                    delay = jittered_backoff(attempt, base_delay=1.0)
+                else:
+                    delay = jittered_backoff(attempt, base_delay=2.0)
+
+                if attempt < MAX_ATTEMPTS - 1:
+                    await asyncio.sleep(delay)
+                else:
+                    return None, classified.user_message
+
+        return None, "All retry attempts exhausted."
+
+    async def _pre_flight_check(
+        self,
+        tcs: List[ToolCall],
+    ) -> Tuple[List[ToolCall], Dict[str, ToolResult]]:
+        """
+        Safety gate run BEFORE inline tool execution.
+
+        For each tool call:
+          - Hardline patterns → blocked unconditionally (no confirmation offered)
+          - Dangerous patterns → blocked if confirmation_fn is set AND user says no
+          - needs_confirmation flag → confirmed if confirmation_fn is set
+          - Everything else → approved
+
+        Returns (approved_tcs, blocked_results) where blocked_results maps
+        tc.id → ToolResult for tools that were blocked or declined.
+        """
+        from BRAIN.tools.exec_tools import check_command_safety, check_python_safety
+
+        approved: List[ToolCall] = []
+        blocked: Dict[str, ToolResult] = {}
+
+        for tc in tcs:
+            tier, reason = "safe", ""
+
+            if tc.name == "run_command":
+                tier, reason = check_command_safety(tc.arguments.get("command", ""))
+            elif tc.name == "run_python":
+                tier, reason = check_python_safety(tc.arguments.get("code", ""))
+            elif self._tool_registry.needs_confirmation(tc.name):
+                tier, reason = "dangerous", f"{tc.name} requires confirmation"
+
+            if tier == "blocked":
+                _log.warning(
+                    "pre_flight | hardline block | tool=%s reason=%s", tc.name, reason
+                )
+                blocked[tc.id] = ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Blocked — this operation is not allowed: {reason}.",
+                )
+                continue
+
+            if tier == "dangerous":
+                if self._confirmation_fn is not None:
+                    question = self._build_confirm_question(tc, reason)
+                    try:
+                        confirmed = await self._confirmation_fn(tc.name, question)
+                    except Exception as exc:
+                        _log.warning("pre_flight | confirmation callback error: %s", exc)
+                        confirmed = False
+
+                    if not confirmed:
+                        _log.info(
+                            "pre_flight | declined by user | tool=%s reason=%s",
+                            tc.name, reason,
+                        )
+                        blocked[tc.id] = ToolResult(
+                            success=False,
+                            output="",
+                            error="Declined by Zafar — not executed.",
+                        )
+                        continue
+                    _log.info(
+                        "pre_flight | confirmed by user | tool=%s", tc.name
+                    )
+                else:
+                    _log.warning(
+                        "pre_flight | dangerous tool with no confirmation_fn — "
+                        "running anyway | tool=%s reason=%s", tc.name, reason,
+                    )
+
+            approved.append(tc)
+
+        return approved, blocked
+
+    def _build_confirm_question(self, tc: ToolCall, reason: str) -> str:
+        """Generate a short, specific confirmation question in SOFi's voice."""
+        if tc.name == "run_command":
+            cmd = tc.arguments.get("command", "")
+            short = cmd[:70] + ("…" if len(cmd) > 70 else "")
+            return f"`{short}` — {reason}. Confirm?"
+        if tc.name == "run_python":
+            return f"Python code contains {reason}. Confirm?"
+        return f"{tc.name} — {reason}. Confirm?"
 
     def _require_ready(self) -> None:
         if not self._is_ready or self._llm is None or self._memory is None:
@@ -999,6 +1412,36 @@ class Brain:
 # =============================================================================
 # Helpers
 # =============================================================================
+
+def _cleanup_temp_files(max_age_hours: int = 24, max_files: int = 50) -> None:
+    """
+    Remove old .temp/ files from sub-agent outputs.
+
+    Keeps the directory from growing unbounded. Runs synchronously on
+    shutdown — fast enough for dozens of files.
+    """
+    from pathlib import Path as _P
+    import time as _time
+
+    temp_dir = _P(__file__).parent.parent / ".temp"
+    if not temp_dir.exists():
+        return
+
+    cutoff = _time.time() - (max_age_hours * 3600)
+    files = sorted(temp_dir.glob("*.md"), key=lambda f: f.stat().st_mtime)
+
+    removed = 0
+    for f in files:
+        try:
+            if f.stat().st_mtime < cutoff or len(files) - removed > max_files:
+                f.unlink()
+                removed += 1
+        except Exception:
+            pass
+
+    if removed:
+        _log.info("temp_cleanup | removed %d old file(s) from .temp/", removed)
+
 
 def _trigger_consolidation_on_shutdown() -> None:
     """
@@ -1161,7 +1604,7 @@ def _tool_display_name(tool_name: str, is_background: bool = False) -> str:
         "run_command":          "running command...",
         "run_python":           "running Python...",
         # Sub-agents
-        "spawn_agent":          "delegating to sub-agent...",
+        "spawn_agent":          "working on it...",
         # Skills
         "skills_list":          "checking skills...",
         "skills_load":          "loading skill...",

@@ -10,6 +10,7 @@ Phase 2 surface: persona + long-term memory wired. First boot takes ~30s
 
 import asyncio
 import logging
+import signal
 import sys
 import time
 import warnings
@@ -107,6 +108,21 @@ async def main() -> None:
         new = await _ref[0].hot_reload()
         _ref[0] = new
 
+    # Graceful shutdown on SIGINT/SIGTERM — ensures memory flush, consolidation,
+    # and background task cleanup happen instead of hard-killing the process.
+    _shutdown_requested = False
+
+    def _signal_handler(signum, frame):
+        nonlocal _shutdown_requested
+        if _shutdown_requested:
+            sys.exit(1)
+        _shutdown_requested = True
+        console.print("\n[dim]shutting down gracefully…[/dim]")
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _signal_handler)
+
     try:
         await run_cli(
             process=lambda msg: _ref[0].process(msg),
@@ -116,6 +132,8 @@ async def main() -> None:
             tool_status_fn=lambda: _ref[0].tool_status(),
             tool_calls_fn=lambda: _ref[0].last_tool_calls,
             reload_fn=_reload,
+            set_confirmation_fn=lambda fn: _ref[0].set_confirmation_handler(fn),
+            get_proactive_fn=lambda: _ref[0].get_pending_proactive(),
         )
     finally:
         await _ref[0].shutdown()
