@@ -322,6 +322,31 @@ _OUTPUT_CONTRACT = (
 )
 
 
+def _last_response_block(sofi_state) -> str:
+    """
+    Compact 'what I said last turn' anchor — topics, commitments, questions.
+
+    Only rendered when at least one field is non-empty. Keeps SOFi's side
+    of the dialogue from disappearing between turns without extra LTM cost.
+    Token cost: 0 when empty, ~30-80 tok when populated.
+    """
+    if sofi_state is None:
+        return ""
+    topics      = list(getattr(sofi_state, "last_topics_discussed", None) or [])
+    commitments = list(getattr(sofi_state, "last_commitments",      None) or [])
+    questions   = list(getattr(sofi_state, "last_questions_asked",  None) or [])
+    if not any([topics, commitments, questions]):
+        return ""
+    lines: List[str] = []
+    if topics:
+        lines.append(f"Topics I covered: {', '.join(topics[:5])}")
+    for c in commitments[:3]:
+        lines.append(f"Committed to: {c}")
+    for q in questions[:2]:
+        lines.append(f"Asked: {q}")
+    return _section("WHAT I SAID LAST TURN", "\n".join(lines))
+
+
 def _self_model_block(self_model) -> str:
     """
     Render the self-model's dynamic capabilities as a prompt section.
@@ -386,6 +411,24 @@ def _skills_block(skills_registry) -> str:
     return _section("AVAILABLE SKILLS", "\n".join(lines))
 
 
+def _proactive_block(item_title: str = "") -> str:
+    """
+    Injected when SOFi is speaking unprompted (a background task just completed).
+
+    Signals: keep it short, just announce the result, don't pre-amble.
+    Token cost: ~60 tok.
+    """
+    note = f"Completed: {item_title}" if item_title else "A background task just completed."
+    return _section(
+        "SPEAKING UNPROMPTED",
+        f"{note}\n\n"
+        "I'm interrupting to report this — Zafar didn't ask. "
+        "One short, direct announcement: what finished and the headline result. "
+        "No 'I've been working on…' buildup — lead with the headline, "
+        "offer to elaborate if he wants more.",
+    )
+
+
 def build_prompt(
     full_context,
     *,
@@ -395,6 +438,8 @@ def build_prompt(
     action_state=None,
     self_model=None,
     skills_registry=None,
+    is_proactive: bool = False,
+    proactive_title: str = "",
 ) -> str:
     """
     Build the full system prompt for one turn.
@@ -429,9 +474,11 @@ def build_prompt(
         persona,
         _current_moment_block(sofi_state, mode),
         _user_state_block(user_state),
+        _last_response_block(sofi_state),
         _self_model_block(self_model),
         _skills_block(skills_registry),
         _action_state_block(action_state),
+        _proactive_block(proactive_title) if is_proactive else "",
         _orchestration_block(intent),
         _memory_blocks(mem_state),
         _OUTPUT_CONTRACT,  # Always last — freshest instruction before generation starts

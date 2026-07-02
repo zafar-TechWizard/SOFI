@@ -12,11 +12,15 @@ The ToolRegistry syncs with SelfModel — when a tool registers, SOFi's
 prompt automatically reflects "I can do X" or "I can't do X right now."
 """
 
+import asyncio
 import json
+import logging
 import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+
+_log = logging.getLogger("sofi.brain.tools")
 
 from BRAIN.state.self_model import Capability, SelfModel
 
@@ -72,6 +76,7 @@ class ToolEntry:
     # background=True → fire-and-forget dispatch; SOFi does NOT block on result.
     # Result flows back via AgenticWorkspace and surfaces next turn.
     background: bool = False
+    timeout: float = 60.0
     category: str = "general"
     capability_name: Optional[str] = None
     capability_description: Optional[str] = None
@@ -90,6 +95,11 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: Dict[str, ToolEntry] = {}
+        self._self_model: Optional[SelfModel] = None
+
+    def set_self_model(self, self_model: SelfModel) -> None:
+        """Wire SelfModel so execute() can pre-check capability state."""
+        self._self_model = self_model
 
     def register(self, entry: ToolEntry) -> None:
         if not entry.name:
@@ -150,21 +160,62 @@ class ToolRegistry:
                 error=f"Tool '{tool_call.name}' is not available right now.",
             )
 
+        # Self-model gate: if capability was explicitly marked offline/unbuilt,
+        # return honest refusal without executing — prevents wasted LLM retries.
+        if self._self_model is not None:
+            cap_name = tool.capability_name or tool.name
+            reason = self._self_model.get_unavailable_reason(cap_name)
+            if reason:
+                _log.info(
+                    "execute | self-model gate | tool=%s reason=%s",
+                    tool_call.name, reason,
+                )
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=reason,
+                )
+
+        from BRAIN.observability.metrics import get_metrics
+        _m = get_metrics()
+
         t0 = time.perf_counter()
         try:
             result = tool.handler(**tool_call.arguments)
             if hasattr(result, "__await__"):
-                result = await result
+                result = await asyncio.wait_for(result, timeout=tool.timeout)
             duration_ms = (time.perf_counter() - t0) * 1000
 
+            _m.inc("tool_executions")
+            _m.observe("tool_duration_ms", duration_ms)
+
             output = str(result) if result is not None else "Done."
+            from BRAIN.tools.output_limits import truncate_result
+            output = truncate_result(tool_call.name, output)
             return ToolResult(
                 success=True,
                 output=output,
                 duration_ms=duration_ms,
             )
+        except asyncio.TimeoutError:
+            duration_ms = (time.perf_counter() - t0) * 1000
+            _m.inc("tool_errors")
+            _m.inc("tool_timeouts")
+            _m.observe("tool_duration_ms", duration_ms)
+            _log.warning(
+                "execute | timeout | tool=%s after %.0fms (limit=%.0fs)",
+                tool_call.name, duration_ms, tool.timeout,
+            )
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Tool timed out after {tool.timeout:.0f}s.",
+                duration_ms=duration_ms,
+            )
         except Exception as exc:
             duration_ms = (time.perf_counter() - t0) * 1000
+            _m.inc("tool_errors")
+            _m.observe("tool_duration_ms", duration_ms)
             return ToolResult(
                 success=False,
                 output="",

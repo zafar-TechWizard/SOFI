@@ -46,10 +46,12 @@ from memory.working_memory.working_context import (
 
 import os
 
-from BRAIN.llm import GeminiClient, GroqClient
+from BRAIN.llm import GeminiClient, GroqClient, LLMProvider
 from BRAIN.context_compression import compress_loop_messages
 from BRAIN.llm.error_classifier import classify_error, ErrorReason
 from BRAIN.llm.retry_utils import jittered_backoff
+from BRAIN.llm.sanitizer import extract_retry_after, sanitize_messages, validate_response
+from BRAIN.observability.metrics import get_metrics
 from BRAIN.mode import Mode, ModeController
 from BRAIN.persona.persona import (
     DEFAULT_MODE,
@@ -102,7 +104,7 @@ class Brain:
         memory_log: bool = False,
         memory_review: bool = False,
     ):
-        self._llm: Optional[Any] = None
+        self._llm: Optional[LLMProvider] = None
         self._memory: Optional[MemoryManager] = None
         self._model_override = model
         self._mode: Mode = Mode(mode) if isinstance(mode, str) else mode
@@ -168,14 +170,15 @@ class Brain:
         set_self_model(self._self_model)
         warm_cache()
 
-        # LLM backend: SOFI_LLM_BACKEND=groq to switch; default is Gemini.
-        backend = os.environ.get("SOFI_LLM_BACKEND", "gemini").lower().strip()
-        if backend == "groq":
-            _tick("connecting Groq")
-            self._llm = GroqClient(model=self._model_override)
-        else:
-            _tick("connecting Gemini")
-            self._llm = GeminiClient(model=self._model_override)
+        # LLM backend: SOFI_LLM_PROVIDERS=gemini,groq for multi-provider failover.
+        # Falls back to SOFI_LLM_BACKEND=groq (legacy single-provider env var).
+        # Single provider = ProviderPool with one slot; zero overhead vs. before.
+        from BRAIN.llm.provider_pool import ProviderPool
+        _providers_env = os.environ.get("SOFI_LLM_PROVIDERS", "").strip()
+        _backend_env   = os.environ.get("SOFI_LLM_BACKEND", "").strip()
+        _provider_label = _providers_env or _backend_env or "gemini"
+        _tick(f"connecting LLM ({_provider_label})")
+        self._llm = ProviderPool.from_env(model_override=self._model_override)
 
         _tick("registering tools")
         self._tool_registry = ToolRegistry()
@@ -193,8 +196,10 @@ class Brain:
         )
         self._heartbeat.start()
         self._tool_registry.sync_with_self_model(self._self_model)
+        self._tool_registry.set_self_model(self._self_model)
         set_self_model(self._self_model)
         warm_cache()
+        self._start_capability_monitor()
 
         tool_status = self._tool_registry.status()
         _log.info(
@@ -296,6 +301,8 @@ class Brain:
             "BRAIN.prompt",
             "BRAIN.llm.groq_client",
             "BRAIN.llm.gemini_client",
+            "BRAIN.llm.circuit_breaker",
+            "BRAIN.llm.provider_pool",
             "BRAIN.llm",
             "BRAIN.tools.registry",
             "BRAIN.tools",
@@ -351,15 +358,20 @@ class Brain:
 
         # Carry over in-session conversational state so the reload is invisible to SOFi.
         new_brain._local_history = list(self._local_history)
-        new_brain._prev_user_state = self._prev_user_state
+        new_brain._prev_user_state = None
+        new_brain._last_mode_decision = None
         new_brain._prev_mode = self._prev_mode
         new_brain._prev_was_override = self._prev_was_override
         new_brain._forced_mode = self._forced_mode
 
+        # Carry over proactive notification queue (lost on reload otherwise).
+        with self._proactive_lock:
+            new_brain._proactive_items = list(self._proactive_items)
+
         # Carry over sub-agent infrastructure — live agents must survive reload.
         new_brain._active_registry = self._active_registry
         new_brain._heartbeat = self._heartbeat
-        new_brain._background_tasks = self._background_tasks
+        new_brain._background_tasks = {t for t in self._background_tasks if not t.done()}
 
         # Carry over CLI-wired callbacks — these are closures on the terminal
         # session and console, which survive across reloads unchanged.
@@ -423,6 +435,7 @@ class Brain:
     async def process(self, message: str) -> AsyncIterator[str]:
         self._require_ready()
         self._last_tool_calls = []
+        _turn_start = time.perf_counter()
 
         self._local_history.append({"role": "user", "content": message})
         self._local_history = self._local_history[-self.MAX_LOCAL_TURNS:]
@@ -556,13 +569,20 @@ class Brain:
         _spill_dir = _Path(__file__).parent.parent / ".temp"
 
         MAX_CONTINUATIONS = 3
+        MAX_EMPTY_RETRIES = 2
         PROGRESSIVE_MAX_TOKENS = [8192, 12288, 16384]
+        _empty_retry_count = 0
 
         if not tool_defs:
             _log.debug("process | no tools registered — pure conversation stream")
             async for token in self._llm.stream(system_prompt, messages):
                 response_text += token
                 yield token
+            if not response_text:
+                _log.warning("process | stream returned no tokens")
+                fallback = "I didn't get a response from the model. Try again, sir."
+                response_text = fallback
+                yield fallback
         else:
             _log.debug("process | agentic loop start | tools=%d", len(tool_defs))
 
@@ -589,6 +609,9 @@ class Brain:
                     })
                     current_tool_defs = []
 
+                # ── Sanitize messages before LLM call ──
+                messages = sanitize_messages(messages)
+
                 # ── LLM call with retry ──
                 max_tok = PROGRESSIVE_MAX_TOKENS[
                     min(_continuation_count, len(PROGRESSIVE_MAX_TOKENS) - 1)
@@ -604,6 +627,26 @@ class Brain:
                     error_text = f"\n\n{error_msg}"
                     response_text += error_text
                     yield error_text
+                    break
+
+                # ── Post-parse validation (drops invalid tool calls, fixes types) ──
+                validate_response(response)
+
+                # ── CASE: finish_reason == "error" (empty response from provider) ──
+                if response.finish_reason == "error":
+                    _empty_retry_count += 1
+                    if _empty_retry_count <= MAX_EMPTY_RETRIES and iteration < self.MAX_TOOL_ITERATIONS:
+                        _log.warning(
+                            "process | empty response from provider — retrying (%d/%d)",
+                            _empty_retry_count, MAX_EMPTY_RETRIES,
+                        )
+                        await asyncio.sleep(1.0)
+                        continue
+                    _exit_reason = "empty_provider_response"
+                    _log.warning(
+                        "process | empty response — giving up after %d retries",
+                        _empty_retry_count,
+                    )
                     break
 
                 # ── CASE: finish_reason == "length" ──
@@ -853,6 +896,27 @@ class Brain:
             self._local_history = self._local_history[-self.MAX_LOCAL_TURNS:]
             _log.debug("process | response saved to memory | len=%d", len(response_text))
 
+        # ── SofiState update (post-response, rule-based, ~0.1ms) ──
+        if _memory_ok and response_text:
+            self._update_sofi_state(decision, response_text, user_state)
+
+        # ── Response analysis (fire-and-forget, ~1ms in background) ──
+        if _memory_ok and response_text:
+            _t = asyncio.create_task(
+                self._analyze_response(response_text),
+                name="sofi-response-analyzer",
+            )
+            self._background_tasks.add(_t)
+            _t.add_done_callback(self._background_tasks.discard)
+
+        # ── Metrics (fire-and-forget, sub-µs) ──
+        _m = get_metrics()
+        _m.inc("turns")
+        _m.observe("turn_latency_ms", (time.perf_counter() - _turn_start) * 1000)
+        if response_text:
+            _m.observe("response_chars", len(response_text))
+        _m.flush()
+
         # ─── PHASE F: Mark delivered tasks ───
         # If there were completed deliveries in the action_state and SOFi
         # generated a response (meaning she delivered them), mark as delivered.
@@ -865,6 +929,93 @@ class Brain:
                     if task_id:
                         tm.mark_delivered(task_id)
                         _log.info("process | task marked delivered | id=%s", task_id)
+
+    async def process_proactive(self, item) -> AsyncIterator[str]:
+        """
+        SOFi speaks unprompted to announce a completed background task.
+
+        Called by the CLI when an URGENT WorkspaceItem arrives during an idle prompt.
+        Skips the memory observe for the synthetic trigger (no meaningful user message),
+        but saves SOFi's response as a normal assistant turn.
+
+        Yields the same token stream as process() — CLI renders it identically.
+        """
+        self._require_ready()
+        _turn_start = time.perf_counter()
+
+        item_title = getattr(item, "title", "") or ""
+        item_desc  = getattr(item, "description", "") or ""
+        meta       = getattr(item, "metadata", {}) or {}
+
+        # Build a synthetic message so memory context + recent turns are available,
+        # but we don't add it as a real user turn.
+        synthetic = f"[PROACTIVE] {item_title}: {item_desc[:200]}"
+
+        _memory_ok = True
+        try:
+            await self._memory.get_context_async("assistant", synthetic)
+            ctx = self._memory.get_full_context()
+        except Exception as mem_exc:
+            _log.warning("process_proactive | memory unavailable | %s", mem_exc)
+            _memory_ok = False
+            ctx = None
+
+        from BRAIN.mode.controller import ModeDecision
+        decision = ModeDecision(
+            mode=Mode.CONVERSATIONAL,
+            allow_dropped_formality=False,
+            scores={},
+            triggered_overrides=["proactive"],
+            held_prev=False,
+        )
+
+        system_prompt = build_prompt(
+            ctx,
+            mode=decision.mode.value,
+            allow_dropped_formality=False,
+            is_proactive=True,
+            proactive_title=item_title,
+        )
+
+        messages = []
+        if _memory_ok and ctx is not None:
+            messages = build_messages(ctx, synthetic)
+        else:
+            messages = list(self._local_history)
+        # Replace the synthetic message with a clean delivery-context message
+        # so the LLM knows WHAT to announce without polluting history.
+        if messages and messages[-1].get("content", "").startswith("[PROACTIVE]"):
+            messages[-1]["content"] = (
+                f"Background task completed — announce it briefly:\n"
+                f"Task: {item_title}\n"
+                f"Result: {item_desc[:300]}"
+            )
+
+        response_text = ""
+        try:
+            async for token in self._llm.stream(system_prompt, messages):
+                response_text += token
+                yield token
+        except Exception as exc:
+            _log.warning("process_proactive | stream error | %s", exc)
+            fallback = f"That background task finished, sir. {item_title}."
+            response_text = fallback
+            yield fallback
+
+        # Save proactive response to memory as assistant turn
+        if response_text and _memory_ok:
+            try:
+                await self._memory.observe("assistant", response_text)
+            except Exception:
+                pass
+
+        self._local_history.append({"role": "assistant", "content": response_text})
+        self._local_history = self._local_history[-self.MAX_LOCAL_TURNS:]
+
+        _m = get_metrics()
+        _m.inc("proactive_turns")
+        _m.observe("turn_latency_ms", (time.perf_counter() - _turn_start) * 1000)
+        _m.flush()
 
     def clear_history(self) -> None:
         self._local_history.clear()
@@ -1088,7 +1239,12 @@ class Brain:
             "tools": self._tool_registry.status(),
             "last_tool_calls": self._last_tool_calls,
             "background_tasks_active": len(self._background_tasks),
+            "metrics": get_metrics().snapshot(),
         }
+        # Provider pool health (circuit breaker states per provider)
+        from BRAIN.llm.provider_pool import ProviderPool
+        if isinstance(self._llm, ProviderPool):
+            snap["providers"] = self._llm.health_report()
 
         ws = self._get_workspace()
         if ws:
@@ -1276,6 +1432,7 @@ class Brain:
 
         for attempt in range(MAX_ATTEMPTS):
             try:
+                get_metrics().inc("llm_calls")
                 response = await self._llm.call_with_tools(
                     system_prompt, messages, tool_defs,
                     max_tokens_override=max_tokens_override,
@@ -1284,6 +1441,8 @@ class Brain:
 
             except Exception as exc:
                 classified = classify_error(exc)
+                get_metrics().inc("llm_errors")
+                get_metrics().inc(f"llm_error_{classified.reason.value}")
                 _log.warning(
                     "_call_llm_with_retry | attempt=%d reason=%s retryable=%s | %s",
                     attempt + 1, classified.reason.value, classified.retryable, exc,
@@ -1302,7 +1461,8 @@ class Brain:
                 if classified.reason in (
                     ErrorReason.RATE_LIMIT, ErrorReason.OVERLOADED,
                 ):
-                    delay = jittered_backoff(attempt, base_delay=3.0)
+                    retry_after = extract_retry_after(exc)
+                    delay = retry_after if retry_after else jittered_backoff(attempt, base_delay=3.0)
                 elif classified.reason in (
                     ErrorReason.SERVER_ERROR, ErrorReason.TIMEOUT,
                 ):
@@ -1401,6 +1561,119 @@ class Brain:
         if tc.name == "run_python":
             return f"Python code contains {reason}. Confirm?"
         return f"{tc.name} — {reason}. Confirm?"
+
+    def _update_sofi_state(self, decision, response_text: str, user_state) -> None:
+        """
+        Post-response SofiState enrichment. Rule-based, ~0.1ms.
+        Wrapped in try/except — enrichment, not correctness.
+        """
+        try:
+            _TONE_MAP = {
+                Mode.CONVERSATIONAL: "calm",
+                Mode.FOCUSED: "focused",
+                Mode.CREATIVE: "playful",
+            }
+            if decision.mode == Mode.EMPATHETIC:
+                tone = "warm" if (user_state.emotional_intensity or 0) > 0.5 else "concerned"
+            else:
+                tone = _TONE_MAP.get(decision.mode, "neutral")
+
+            resp_len = len(response_text)
+            energy = "high" if resp_len > 500 else ("low" if resp_len < 50 else "normal")
+
+            current_focus = ""
+            try:
+                ctx = self._memory.get_full_context()
+                if ctx and hasattr(ctx, "user"):
+                    entities = getattr(ctx.user, "mentioned_entities", None)
+                    if entities:
+                        current_focus = entities[0] if isinstance(entities, list) else str(entities)
+            except Exception:
+                pass
+
+            self._memory.context_manager.update_sofi_state(
+                emotional_tone=tone,
+                energy_level=energy,
+                current_mode=decision.mode.value,
+                current_focus=current_focus,
+            )
+        except Exception as exc:
+            _log.debug("_update_sofi_state | failed (non-critical): %s", exc)
+
+    async def _analyze_response(self, response_text: str) -> None:
+        """
+        Post-response analysis — extracts topics, commitments, questions from
+        SOFi's own output and writes them to SofiState for next-turn awareness.
+        Fire-and-forget: runs as asyncio.Task, never delays streaming.
+        """
+        try:
+            from BRAIN.state.response_analyzer import ResponseAnalyzer
+            analysis = ResponseAnalyzer().analyze(response_text)
+            self._memory.context_manager.update_sofi_response_state(
+                last_topics_discussed=analysis.topics,
+                last_commitments=analysis.commitments,
+                last_questions_asked=analysis.questions,
+            )
+            _log.debug(
+                "_analyze_response | topics=%d commitments=%d questions=%d",
+                len(analysis.topics), len(analysis.commitments), len(analysis.questions),
+            )
+        except Exception as exc:
+            _log.debug("_analyze_response | failed (non-critical): %s", exc)
+
+    def _start_capability_monitor(self) -> None:
+        """
+        Daemon thread that re-checks each tool's check_fn every 60s and
+        updates SelfModel availability state on change.
+
+        This ensures SOFi's self-awareness stays current without any latency
+        impact on the response path.
+        """
+        import time as _time
+
+        def _monitor_loop() -> None:
+            while True:
+                _time.sleep(60)
+                try:
+                    self._check_capabilities_once()
+                except Exception as exc:
+                    _log.debug("capability_monitor | error: %s", exc)
+
+        t = threading.Thread(
+            target=_monitor_loop,
+            name="sofi-capability-monitor",
+            daemon=True,
+        )
+        t.start()
+        _log.debug("capability_monitor | started (60s interval)")
+
+    def _check_capabilities_once(self) -> None:
+        """Check all tools with check_fn and update SelfModel on state change."""
+        if self._self_model is None:
+            return
+        changed = 0
+        for entry in self._tool_registry._tools.values():
+            if entry.check_fn is None:
+                continue
+            cap_name = entry.capability_name or entry.name
+            cap = self._self_model.get(cap_name)
+            if cap is None:
+                continue
+            try:
+                now_available = bool(entry.check_fn())
+            except Exception:
+                now_available = False
+            if cap.available != now_available:
+                cap.available = now_available
+                changed += 1
+                _log.info(
+                    "capability_monitor | state change | cap=%s available=%s",
+                    cap_name, now_available,
+                )
+        if changed:
+            set_self_model(self._self_model)
+            warm_cache()
+            _log.debug("capability_monitor | %d capability change(s) — cache refreshed", changed)
 
     def _require_ready(self) -> None:
         if not self._is_ready or self._llm is None or self._memory is None:
@@ -1511,21 +1784,43 @@ def _auto_register_tools(registry) -> None:
             skipped.append(path.stem)
             continue
 
-        # Look for a register(registry) function
+        # Pattern A: register(registry) function — for complex / closure-based tools.
         register_fn = getattr(mod, "register", None)
-        if register_fn is None or not callable(register_fn):
-            continue  # no register() in this file — skip silently
+        if register_fn is not None and callable(register_fn):
+            try:
+                register_fn(registry)
+                registered.append(path.stem)
+                _log.debug("_auto_register_tools | register() | module=%s", path.stem)
+            except Exception as exc:
+                _log.warning(
+                    "_auto_register_tools | register() failed | module=%s exc=%s",
+                    path.stem, exc,
+                )
+                skipped.append(path.stem)
 
-        try:
-            register_fn(registry)
-            registered.append(path.stem)
-            _log.debug("_auto_register_tools | registered | module=%s", path.stem)
-        except Exception as exc:
-            _log.warning(
-                "_auto_register_tools | register() failed | module=%s exc=%s",
-                path.stem, exc,
-            )
-            skipped.append(path.stem)
+        # Pattern B: @tool-decorated functions — ToolEntry stored as fn._tool_entry.
+        # Both patterns can coexist in the same file.
+        for attr_name in dir(mod):
+            try:
+                obj = getattr(mod, attr_name)
+            except Exception:
+                continue
+            entry = getattr(obj, "_tool_entry", None)
+            if entry is None:
+                continue
+            try:
+                registry.register(entry)
+                if path.stem not in registered:
+                    registered.append(path.stem)
+                _log.debug(
+                    "_auto_register_tools | @tool | module=%s name=%s",
+                    path.stem, entry.name,
+                )
+            except Exception as exc:
+                _log.warning(
+                    "_auto_register_tools | @tool failed | module=%s name=%s exc=%s",
+                    path.stem, attr_name, exc,
+                )
 
     _log.info(
         "_auto_register_tools | done | registered=%s skipped=%s total_tools=%d",

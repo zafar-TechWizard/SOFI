@@ -210,6 +210,25 @@ class SelfModel:
         """Return the registered Capability by name, or None."""
         return self._registered.get(name)
 
+    def is_available(self, name: str) -> bool:
+        """Return True iff the capability is installed AND available."""
+        cap = self._registered.get(name)
+        return cap.is_working if cap is not None else True  # unknown = assume ok
+
+    def get_unavailable_reason(self, name: str) -> Optional[str]:
+        """
+        Return the refusal string for an offline/unbuilt capability,
+        or None if the capability is available (or unknown).
+        """
+        cap = self._registered.get(name)
+        if cap is None or cap.is_working:
+            return None
+        if cap.installed and not cap.available:
+            return cap.refusal_offline or f"I can't use {name} right now."
+        if not cap.installed:
+            return cap.refusal_not_built or f"{name} isn't built into me yet."
+        return None
+
     def all_capabilities(self) -> List[Capability]:
         """All registered capabilities (does not include baseline lines)."""
         return list(self._registered.values())

@@ -34,6 +34,7 @@ class SubAgentRecord:
 
     interrupted: bool = False
     _cancel_event: threading.Event = field(default_factory=threading.Event)
+    _task: Optional[asyncio.Task] = field(default=None, repr=False)
 
     def touch(self, iteration: int = 0, tool: Optional[str] = None) -> None:
         self.last_activity = time.time()
@@ -45,6 +46,8 @@ class SubAgentRecord:
     def interrupt(self) -> None:
         self.interrupted = True
         self._cancel_event.set()
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
 
     @property
     def is_interrupted(self) -> bool:

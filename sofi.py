@@ -134,6 +134,7 @@ async def main() -> None:
             reload_fn=_reload,
             set_confirmation_fn=lambda fn: _ref[0].set_confirmation_handler(fn),
             get_proactive_fn=lambda: _ref[0].get_pending_proactive(),
+            process_proactive_fn=lambda item: _ref[0].process_proactive(item),
         )
     finally:
         await _ref[0].shutdown()

@@ -49,6 +49,8 @@ SetModeFn      = Optional[Callable[[str], None]]
 ToolStatusFn   = Optional[Callable[[], Dict[str, Any]]]
 ToolCallsFn    = Optional[Callable[[], List[Dict[str, Any]]]]
 ReloadFn       = Optional[Callable[[], Any]]   # async: () -> new Brain (or None)
+# (tool_name: str, question: str) → bool; wired ONCE after PromptSession is created
+SetConfirmFn   = Optional[Callable[[Callable], None]]
 
 
 # ============================================================================
@@ -476,6 +478,9 @@ async def _handle_reload(console: Console, reload_fn: ReloadFn) -> None:
 # Public entry point
 # ============================================================================
 
+ProcessProactiveFn = Optional[Callable]  # (item) -> AsyncIterator[str]
+
+
 async def run_cli(
     process: ProcessFn,
     clear_history: ClearFn,
@@ -485,19 +490,24 @@ async def run_cli(
     tool_status_fn: ToolStatusFn = None,
     tool_calls_fn: ToolCallsFn = None,
     reload_fn: ReloadFn = None,
+    set_confirmation_fn: SetConfirmFn = None,
+    get_proactive_fn=None,   # () -> list[WorkspaceItem] — completed background tasks
+    process_proactive_fn: ProcessProactiveFn = None,  # (item) -> AsyncIterator[str]
 ) -> None:
     """
     Run the interactive SOFi terminal.
 
     Args:
-        process:         async callable; given a user message, returns a token iterator.
-        clear_history:   sync callable to wipe brain's in-memory short history.
-        inspector:       optional sync callable returning a dict snapshot.
-        set_mode:        optional sync callable to force a mode (or 'auto').
-        greeting:        optional cold-start greeting line.
-        tool_status_fn:  returns tool registry status for /tools command.
-        tool_calls_fn:   returns list of tool calls from the last turn.
-        reload_fn:       async callable that hot-reloads BRAIN code; returns new Brain.
+        process:             async callable; given a user message, returns a token iterator.
+        clear_history:       sync callable to wipe brain's in-memory short history.
+        inspector:           optional sync callable returning a dict snapshot.
+        set_mode:            optional sync callable to force a mode (or 'auto').
+        greeting:            optional cold-start greeting line.
+        tool_status_fn:      returns tool registry status for /tools command.
+        tool_calls_fn:       returns list of tool calls from the last turn.
+        reload_fn:           async callable that hot-reloads BRAIN code; returns new Brain.
+        set_confirmation_fn: called once after PromptSession is ready; receives the
+                             async confirmation callback so brain can wire it in.
     """
     console = Console()
 
@@ -548,11 +558,122 @@ async def run_cli(
         complete_while_typing=True,
     )
 
+    # ─── Confirmation handler ───────────────────────────────────────────────
+    # Called by brain.py pre-flight before any dangerous tool executes.
+    # Runs input() in a thread-pool executor so the event loop stays live.
+    # Rich handles the print correctly even while a Live panel is active.
+
+    async def _ask_confirmation(tool_name: str, question: str) -> bool:
+        loop = asyncio.get_event_loop()
+        console.print(f"\n[bold yellow]⚠[/bold yellow]  {question}")
+        answer: str = await loop.run_in_executor(
+            None,
+            lambda: input("  y / n ▸ ").strip().lower(),
+        )
+        approved = answer in ("y", "yes")
+        if approved:
+            console.print("[dim]  confirmed.[/dim]")
+        else:
+            console.print("[dim]  declined — not executing.[/dim]")
+        return approved
+
+    if set_confirmation_fn is not None:
+        set_confirmation_fn(_ask_confirmation)
+
     # ─── Main loop ─────────────────────────────────────────────────────────
+    _last_proactive_ts: float = 0.0   # rate-limit: max 1 proactive notify / 30s
+    _PROACTIVE_RATE_S: float = 30.0
+    _PROACTIVE_POLL_S: float = 2.0    # check every 2s while prompt is idle
+    # Items drained from brain's queue during mid-prompt polling that weren't
+    # urgent enough to interrupt — held here and processed before the next prompt.
+    _deferred_proactive: list = []
+
     while True:
+        # ── Proactive items: checked BEFORE showing the prompt ──
+        # Processes both items deferred from the last polling tick AND any new
+        # items from brain's queue (all priorities — no active prompt to interrupt).
+        if process_proactive_fn:
+            try:
+                pending = list(_deferred_proactive)
+                _deferred_proactive.clear()
+                if get_proactive_fn:
+                    pending.extend(get_proactive_fn())
+                for item in pending:
+                    console.print(
+                        f"\n[bold cyan]●[/bold cyan] "
+                        f"[cyan]{item.title[:70]}[/cyan]"
+                    )
+                    await _render_stream(
+                        console,
+                        process_proactive_fn(item),
+                        inspector=inspector,
+                        tool_calls_fn=tool_calls_fn,
+                    )
+            except Exception:
+                pass  # proactive check must never crash the main loop
+
+        # ── Prompt with 2s URGENT polling ──
+        # We run session.prompt_async() as an asyncio task and check for
+        # URGENT proactive items every 2 seconds while it's idle.
+        # URGENT items cancel the prompt, announce immediately, then re-prompt.
+        user_input: Optional[str] = None
         try:
             with patch_stdout():
-                user_input = await session.prompt_async("you ▸ ")
+                _prompt_task = asyncio.ensure_future(
+                    session.prompt_async("you ▸ ")
+                )
+                while True:
+                    done, _ = await asyncio.wait(
+                        [_prompt_task],
+                        timeout=_PROACTIVE_POLL_S,
+                    )
+                    if done:
+                        user_input = _prompt_task.result()
+                        break
+
+                    # 2s tick — check for URGENT proactive items
+                    if get_proactive_fn and process_proactive_fn:
+                        try:
+                            all_items = get_proactive_fn()
+                            urgent = [
+                                i for i in all_items
+                                if str(getattr(i, "notify_priority", "low")).lower() == "urgent"
+                            ]
+                            non_urgent = [
+                                i for i in all_items
+                                if str(getattr(i, "notify_priority", "low")).lower() != "urgent"
+                            ]
+
+                            # Non-urgent items: defer to the top of the next loop
+                            # iteration (processed before the next prompt).
+                            _deferred_proactive.extend(non_urgent)
+
+                            now = time.perf_counter()
+                            if urgent and (now - _last_proactive_ts) >= _PROACTIVE_RATE_S:
+                                _last_proactive_ts = now
+                                _prompt_task.cancel()
+                                try:
+                                    await _prompt_task
+                                except (asyncio.CancelledError, Exception):
+                                    pass
+                                # Process one urgent item now; defer the rest.
+                                console.print(
+                                    f"\n[bold cyan]●[/bold cyan] "
+                                    f"[cyan]{urgent[0].title[:70]}[/cyan]"
+                                )
+                                await _render_stream(
+                                    console,
+                                    process_proactive_fn(urgent[0]),
+                                    inspector=inspector,
+                                    tool_calls_fn=tool_calls_fn,
+                                )
+                                _deferred_proactive.extend(urgent[1:])
+                                # Re-prompt after the proactive response
+                                _prompt_task = asyncio.ensure_future(
+                                    session.prompt_async("you ▸ ")
+                                )
+                        except Exception:
+                            pass  # proactive polling must never crash the loop
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]exiting.[/dim]")
             return

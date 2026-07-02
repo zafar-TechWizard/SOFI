@@ -20,9 +20,14 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
 
+import logging
+
 from groq import AsyncGroq
 
 from BRAIN.llm.retry_utils import jittered_backoff
+from BRAIN.llm.sanitizer import extract_retry_after
+
+_log = logging.getLogger("sofi.brain.groq")
 
 
 @dataclass
@@ -82,6 +87,7 @@ class GroqClient:
             *messages,
         ]
 
+        import time as _time
         response_stream = await self._client.chat.completions.create(
             model=self.model,
             messages=full_messages,
@@ -90,12 +96,22 @@ class GroqClient:
             max_tokens=self.max_tokens,
         )
 
+        _t0 = _time.perf_counter()
+        _chunks = 0
+        _bytes = 0
         async for chunk in response_stream:
+            _chunks += 1
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta.content
             if delta:
+                _bytes += len(delta)
                 yield delta
+        _elapsed = (_time.perf_counter() - _t0) * 1000
+        _log.debug(
+            "stream | done | chunks=%d bytes=%d elapsed_ms=%.0f",
+            _chunks, _bytes, _elapsed,
+        )
 
     # ─── Non-streaming call with tool support (for the agentic loop) ─────────
 
@@ -146,7 +162,10 @@ class GroqClient:
                 if classified in ("content_policy", "auth", "billing", "format_error"):
                     raise
                 if classified == "rate_limit" and attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(jittered_backoff(attempt, base_delay=3.0))
+                    retry_after = extract_retry_after(exc)
+                    delay = retry_after if retry_after else jittered_backoff(attempt, base_delay=3.0)
+                    _log.debug("call_with_tools | rate_limit — waiting %.1fs (provider=%s)", delay, retry_after is not None)
+                    await asyncio.sleep(delay)
                     continue
                 if classified in ("server_error", "overloaded", "timeout") and attempt < self.MAX_RETRIES - 1:
                     await asyncio.sleep(jittered_backoff(attempt, base_delay=1.0))
@@ -154,6 +173,9 @@ class GroqClient:
                 raise
         else:
             raise last_error  # type: ignore[misc]
+
+        if not response.choices:
+            return LLMResponse(finish_reason="error")
 
         choice = response.choices[0]
         result = LLMResponse(finish_reason=choice.finish_reason or "")
@@ -173,6 +195,9 @@ class GroqClient:
                     arguments=args,
                 ))
 
+        if not result.text and not result.tool_calls:
+            result.finish_reason = "error"
+
         return result
 
     # ─── Stream final response (after tool loop, no tools) ───────────────────
@@ -186,6 +211,7 @@ class GroqClient:
         Stream the final text response to the user after the agentic
         loop finishes. No tools passed — just text generation.
         """
+        import time as _time
         full_messages = [
             {"role": "system", "content": system_prompt},
             *messages,
@@ -199,12 +225,22 @@ class GroqClient:
             max_tokens=self.max_tokens,
         )
 
+        _t0 = _time.perf_counter()
+        _chunks = 0
+        _bytes = 0
         async for chunk in response_stream:
+            _chunks += 1
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta.content
             if delta:
+                _bytes += len(delta)
                 yield delta
+        _elapsed = (_time.perf_counter() - _t0) * 1000
+        _log.debug(
+            "stream_final | done | chunks=%d bytes=%d elapsed_ms=%.0f",
+            _chunks, _bytes, _elapsed,
+        )
 
     # ─── Error classification (Hermes pattern) ───────────────────────────────
 

@@ -37,6 +37,7 @@ from google.genai import types
 
 from BRAIN.llm.groq_client import LLMResponse, LLMToolCall
 from BRAIN.llm.retry_utils import jittered_backoff
+from BRAIN.llm.sanitizer import extract_retry_after
 
 
 _log = logging.getLogger("sofi.brain.gemini")
@@ -148,16 +149,27 @@ class GeminiClient:
         _log.debug("stream | model=%s contents=%d", self.model, len(contents))
 
         import asyncio
+        import time as _time
         last_exc = None
         for attempt in range(self.MAX_RETRIES):
             try:
+                _t0 = _time.perf_counter()
+                _chunks = 0
+                _bytes = 0
                 async for chunk in self._client.aio.models.generate_content_stream(
                     model=self.model,
                     contents=contents,
                     config=config,
                 ):
+                    _chunks += 1
                     if chunk.text:
+                        _bytes += len(chunk.text)
                         yield chunk.text
+                _elapsed = (_time.perf_counter() - _t0) * 1000
+                _log.debug(
+                    "stream | done | chunks=%d bytes=%d elapsed_ms=%.0f",
+                    _chunks, _bytes, _elapsed,
+                )
                 return
             except Exception as exc:
                 last_exc = exc
@@ -166,7 +178,10 @@ class GeminiClient:
                 if classified in ("auth", "format_error", "content_filter"):
                     raise
                 if classified == "rate_limit" and attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(jittered_backoff(attempt, base_delay=3.0))
+                    retry_after = extract_retry_after(exc)
+                    delay = retry_after if retry_after else jittered_backoff(attempt, base_delay=3.0)
+                    _log.debug("stream | rate_limit — waiting %.1fs (provider=%s)", delay, retry_after is not None)
+                    await asyncio.sleep(delay)
                     continue
                 if classified in ("server_error", "timeout") and attempt < self.MAX_RETRIES - 1:
                     await asyncio.sleep(jittered_backoff(attempt, base_delay=1.0))
@@ -225,7 +240,10 @@ class GeminiClient:
                 if classified in ("auth", "format_error", "content_filter"):
                     raise
                 if classified == "rate_limit" and attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(jittered_backoff(attempt, base_delay=3.0))
+                    retry_after = extract_retry_after(exc)
+                    delay = retry_after if retry_after else jittered_backoff(attempt, base_delay=3.0)
+                    _log.debug("call_with_tools | rate_limit — waiting %.1fs (provider=%s)", delay, retry_after is not None)
+                    await asyncio.sleep(delay)
                     continue
                 if classified in ("server_error", "timeout") and attempt < self.MAX_RETRIES - 1:
                     await asyncio.sleep(jittered_backoff(attempt, base_delay=1.0))
@@ -523,6 +541,8 @@ def _parse_response(response) -> LLMResponse:
         if shortcut_text:
             result.text = shortcut_text
             result.finish_reason = "stop"
+        else:
+            result.finish_reason = "error"
         return result
 
     candidate = response.candidates[0]
@@ -558,6 +578,8 @@ def _parse_response(response) -> LLMResponse:
         )
         if shortcut_text:
             result.text = shortcut_text
+        elif not result.text:
+            result.finish_reason = "error"
         return result
 
     parts = content.parts or []
@@ -590,9 +612,13 @@ def _parse_response(response) -> LLMResponse:
             )
 
     # Last-resort fallback: if parts gave us nothing, use the shortcut
-    if not result.text and not result.tool_calls and shortcut_text:
-        _log.debug("_parse_response | parts empty — using response.text shortcut")
-        result.text = shortcut_text
+    if not result.text and not result.tool_calls:
+        if shortcut_text:
+            _log.debug("_parse_response | parts empty — using response.text shortcut")
+            result.text = shortcut_text
+        else:
+            _log.warning("_parse_response | parts yielded nothing — marking as error")
+            result.finish_reason = "error"
 
     _log.debug(
         "_parse_response | done | text_len=%d tool_calls=%d finish=%s",
